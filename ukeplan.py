@@ -1030,10 +1030,23 @@ def export_png(pl: Planner, path: str, dpi: int = 200) -> None:
 HTML_ICON_PX = 128
 
 
+def icon_file_stem(key: str) -> str:
+    """Readable file name (no extension) for an icon in an HTML export's icon folder."""
+    if key.startswith("emoji:"):
+        stem = "emoji-" + "-".join(f"{ord(c):x}" for c in key[6:])
+    else:
+        iid = key[4:]
+        stem = str(PREFS.icons.get(iid, {}).get("name") or "") or "icon-" + iid[:6]
+    stem = re.sub(r'[^\w\- ]+', "", stem, flags=re.UNICODE).strip().replace(" ", "-")
+    return stem[:60] or "icon"
+SHARED_ICON_DIR = "ukeplan-ikoner"
+
+
 def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
     """HTML export: the page as vector graphics (same drawing code as the PDF), with print CSS so a
     browser prints it at the planner's paper size. icons="embed": one self-contained file;
-    icons="folder": icons are saved as PNGs in '<name>_icons' next to the file (smaller HTML)."""
+    icons="folder": icons are saved as PNGs in '<name>_icons' next to the file (smaller HTML);
+    icons="shared": same, but in one common folder 'ukeplan-ikoner' that several exports can reuse."""
     w_mm, h_mm = pl.page_mm()
     W, H = w_mm * MM, h_mm * MM
     buf = QBuffer()
@@ -1045,6 +1058,7 @@ def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
     gen.setTitle(pl.title or APP_NAME)
     L = compute_layout(pl, W, H)
     small = {}
+    png_names = {}                                       # PNG bytes -> readable file name (no extension)
     for pb in L.placed:                                  # shrink icons: 128 px is plenty at print size
         if pb.img is not None:
             key = id(pb.img)
@@ -1053,6 +1067,10 @@ def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
                 if max(im.width(), im.height()) > HTML_ICON_PX:
                     im = im.scaled(HTML_ICON_PX, HTML_ICON_PX, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 small[key] = im
+                ib = QBuffer()
+                ib.open(QIODevice.WriteOnly)
+                im.save(ib, "PNG")                       # Qt embeds exactly these bytes in the SVG
+                png_names.setdefault(bytes(ib.data().data()), icon_file_stem(pb.ev.icon))
             pb.img = small[key]
     p = QPainter(gen)
     paint(p, pl, L)
@@ -1061,18 +1079,31 @@ def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
     svg = bytes(buf.data().data()).decode("utf-8")
     svg = svg[svg.index("<svg"):]                       # drop the XML prolog
     svg = re.sub(r'<svg\b([^>]*?)\swidth="[^"]*"([^>]*?)\sheight="[^"]*"', r'<svg\1\2', svg, count=1)
-    if icons == "folder":
-        base = os.path.splitext(path)[0]
-        folder, files = base + "_icons", {}
+    if icons in ("folder", "shared"):
+        if icons == "shared":
+            folder = os.path.join(os.path.dirname(os.path.abspath(path)), SHARED_ICON_DIR)
+        else:
+            folder = os.path.splitext(path)[0] + "_icons"
+        files = {}
 
         def to_file(m):
             raw = base64.b64decode(m.group(1))
-            name = "icon_" + hashlib.md5(raw).hexdigest()[:10] + ".png"
-            if name not in files:
+            if raw in files:
+                name = files[raw]
+            else:
                 os.makedirs(folder, exist_ok=True)
-                with open(os.path.join(folder, name), "wb") as f:
-                    f.write(raw)
-                files[name] = True
+                stem = png_names.get(raw) or "icon-" + hashlib.md5(raw).hexdigest()[:8]
+                name, n = stem + ".png", 1
+                while os.path.exists(os.path.join(folder, name)):     # same icon already there: reuse it
+                    with open(os.path.join(folder, name), "rb") as f:
+                        if f.read() == raw:
+                            break
+                    n += 1                                            # different icon, same name
+                    name = f"{stem}-{n}.png"
+                else:
+                    with open(os.path.join(folder, name), "wb") as f:
+                        f.write(raw)
+                files[raw] = name
             return 'xlink:href="' + urllib.parse.quote(os.path.basename(folder)) + "/" + name + '"'
         svg = re.sub(r'xlink:href="data:image/png;base64,([^"]*)"', to_file, svg)
     title = html_escape(pl.title or APP_NAME)
@@ -1106,7 +1137,7 @@ def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
 
 
 def ask_html_icons(parent) -> Optional[str]:
-    """Ask how to store icons in an HTML export. Returns "embed", "folder" or None (cancelled)."""
+    """Ask how to store icons in an HTML export. Returns "embed", "folder", "shared" or None (cancelled)."""
     st = QSettings()
     dlg = QDialog(parent)
     dlg.setWindowTitle("Export HTML")
@@ -1117,6 +1148,13 @@ def ask_html_icons(parent) -> Optional[str]:
     (r_folder if st.value("html_icons", "embed") == "folder" else r_embed).setChecked(True)
     lay.addWidget(r_embed)
     lay.addWidget(r_folder)
+    c_shared = QCheckBox(f"Share one folder ('{SHARED_ICON_DIR}') between timetables\n"
+                         "Several exports in the same place reuse the same icons.")
+    c_shared.setChecked(st.value("html_icons_shared", "false") in (True, "true"))
+    c_shared.setEnabled(r_folder.isChecked())
+    c_shared.setStyleSheet("margin-left: 22px;")
+    r_folder.toggled.connect(c_shared.setEnabled)
+    lay.addWidget(c_shared)
     bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     bb.accepted.connect(dlg.accept)
     bb.rejected.connect(dlg.reject)
@@ -1125,7 +1163,8 @@ def ask_html_icons(parent) -> Optional[str]:
         return None
     choice = "folder" if r_folder.isChecked() else "embed"
     st.setValue("html_icons", choice)
-    return choice
+    st.setValue("html_icons_shared", c_shared.isChecked())
+    return "shared" if choice == "folder" and c_shared.isChecked() else choice
 
 
 def print_planner(pl: Planner, parent: QWidget) -> None:
@@ -2648,7 +2687,7 @@ def main(argv: list) -> int:
         if export.lower().endswith(".png"):
             export_png(pl, export, 200)
         elif export.lower().endswith((".html", ".htm")):
-            export_html(pl, export, "folder" if "--icons-folder" in argv else "embed")
+            export_html(pl, export, "shared" if "--icons-shared" in argv else "folder" if "--icons-folder" in argv else "embed")
         else:
             export_pdf(pl, export)
         return 0
