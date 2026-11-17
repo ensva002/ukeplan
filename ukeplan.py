@@ -139,6 +139,12 @@ def install_qt_translations(app) -> None:
             _qt_translators.append(t)
 
 
+def asset_path(rel: str) -> str:
+    """A bundled data file, both when run from source and from the PyInstaller build."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
+
 def file_filter() -> str:
     return tr("Timetable (*.timetable);;All files (*)")
 
@@ -3199,6 +3205,9 @@ def safe_name(title: str) -> str:
 def main(argv: list) -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
+    icon_file = asset_path("assets/icon.png")
+    if os.path.isfile(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
     PREFS.load()
     apply_settings()
     install_qt_translations(app)

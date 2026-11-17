@@ -28,11 +28,13 @@ def run(*cmd):
 def write_version():
     """_version.py from the newest git tag (v1.2 -> 1.2). Without git/tags the app reports 'dev'."""
     path = os.path.join(HERE, "_version.py")
-    try:
-        tag = subprocess.run(["git", "describe", "--tags"], cwd=HERE, capture_output=True, text=True,
-                             check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        tag = ""
+    tag = os.environ.get("UKEPLAN_VERSION", "").strip()          # the release workflow passes the tag in
+    if not tag:
+        try:
+            tag = subprocess.run(["git", "describe", "--tags"], cwd=HERE, capture_output=True, text=True,
+                                 check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            tag = ""
     if tag:
         with open(path, "w", encoding="utf-8") as f:
             f.write(f'VERSION = "{tag.lstrip("v")}"\n')
@@ -50,7 +52,13 @@ def main():
     run(py, "-m", "pip", "install", "-q", "-r", "requirements.txt", "pyinstaller")
     for d in ("build", "dist"):
         shutil.rmtree(os.path.join(HERE, d), ignore_errors=True)
-    run(py, "-m", "PyInstaller", "--noconfirm", "--windowed", "--name", "Ukeplan", "ukeplan.py")
+    cmd = [py, "-m", "PyInstaller", "--noconfirm", "--windowed", "--name", "Ukeplan",
+           "--add-data", "assets/icon.png" + os.pathsep + "assets"]       # window icon, loaded at runtime
+    if WIN:
+        cmd += ["--icon", "assets/icon.ico"]
+    elif MAC:
+        cmd += ["--icon", "assets/icon.icns"]
+    run(*cmd, "ukeplan.py")
 
     out = os.path.join(HERE, "release")
     os.makedirs(out, exist_ok=True)
