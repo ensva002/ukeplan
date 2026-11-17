@@ -18,19 +18,22 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QMarginsF, QPointF,
-                            QRectF, QSettings, QSize, QStandardPaths, Qt,
-                            QTextBoundaryFinder, QTime, Signal)
+from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QLibraryInfo, QLocale,
+                            QMarginsF, QPointF, QRectF, QSettings, QSize,
+                            QStandardPaths, Qt, QTextBoundaryFinder, QTime,
+                            QTimer, QTranslator, QUrl, Signal)
 from PySide6.QtGui import (QAbstractTextDocumentLayout, QAction, QColor, QFont,
                            QFontMetricsF, QIcon, QImage, QImageReader,
                            QKeySequence, QPageLayout, QPageSize, QPainter,
                            QPainterPath, QPalette, QPdfWriter, QPen, QPixmap,
-                           QTextDocument, QTextOption)
+                           QTextDocument, QTextOption, QDesktopServices, QValidator)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
@@ -41,14 +44,268 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
                                QTableWidget, QTimeEdit, QToolBar, QVBoxLayout,
-                               QWidget)
+                               QWidget, QFrame, QToolButton)
+
+try:                                  # written by build.py / the release workflow from the git tag
+    from _version import VERSION
+except ImportError:
+    VERSION = "dev"
 
 APP_NAME = "Ukeplan"
 FILE_EXT = ".timetable"
-FILE_FILTER = "Timetable (*.timetable);;All files (*)"
+RELEASES_URL = "https://github.com/ensva002/ukeplan/releases"
+LATEST_API = "https://api.github.com/repos/ensva002/ukeplan/releases/latest"
 
-DAYS = ["Mandag", "Tirsdag", "Onsdag", "Torsdag", "Fredag", "Lørdag", "Søndag"]
-DAYS_SHORT = ["Man", "Tir", "Ons", "Tor", "Fre", "Lør", "Søn"]
+# --------------------------------------------------------------------------
+# Language and clock (set from the user's settings, see apply_settings)
+# --------------------------------------------------------------------------
+LANG = "no"                    # "no" | "en"
+CLOCK24 = True
+
+DAYS_BY_LANG = {
+    "no": (["Mandag", "Tirsdag", "Onsdag", "Torsdag", "Fredag", "Lørdag", "Søndag"],
+           ["Man", "Tir", "Ons", "Tor", "Fre", "Lør", "Søn"]),
+    "en": (["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+           ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]),
+}
+
+
+def default_days() -> list:
+    return list(DAYS_BY_LANG[LANG][0])
+
+
+def default_title() -> str:
+    return tr("Weekly plan")
+
+
+def tr(text: str) -> str:
+    """Translate a UI string (English source text) into the current language."""
+    return text if LANG == "en" else NO.get(text, text)
+
+
+def trn(n: int, one: str, many: str) -> str:
+    return tr(one if n == 1 else many)
+
+
+def day_fallback(i: int) -> str:
+    return tr("Day {n}").format(n=i + 1)
+
+
+def detect_language() -> str:
+    """The OS language if we have it, otherwise Norwegian."""
+    name = QLocale.system().name().lower()          # e.g. nb_NO, nn_NO, en_GB
+    if name.startswith(("nb", "nn", "no")):
+        return "no"
+    if name.startswith("en"):
+        return "en"
+    return "no"
+
+
+def detect_clock24() -> bool:
+    """The OS clock style if we can tell, otherwise 24 hour."""
+    try:
+        fmt = QLocale.system().timeFormat(QLocale.ShortFormat)
+        fmt = re.sub(r"'[^']*'", "", fmt)
+        if re.search(r"[aA]", fmt):
+            return False
+        if re.search(r"[hHkK]", fmt):
+            return True
+    except Exception:
+        pass
+    return True
+
+
+def apply_settings() -> None:
+    global LANG, CLOCK24
+    LANG = PREFS.lang if PREFS.lang in ("no", "en") else detect_language()
+    CLOCK24 = PREFS.clock24 if isinstance(PREFS.clock24, bool) else detect_clock24()
+
+
+_qt_translators: list = []
+
+
+def install_qt_translations(app) -> None:
+    """Standard Qt buttons and dialogs (Yes/No/Cancel ...) in the chosen language, if Qt ships them."""
+    for t in _qt_translators:
+        app.removeTranslator(t)
+    _qt_translators.clear()
+    if LANG != "no":
+        return
+    path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
+    for base in ("qtbase", "qt"):
+        t = QTranslator()
+        if t.load(f"{base}_nb", path):
+            app.installTranslator(t)
+            _qt_translators.append(t)
+
+
+def file_filter() -> str:
+    return tr("Timetable (*.timetable);;All files (*)")
+
+
+def icon_file_filter() -> str:
+    return tr("Images (*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp);;All files (*)")
+
+
+# --------------------------------------------------------------------------
+# Norwegian (bokmål) translations. English source text -> Norwegian.
+# --------------------------------------------------------------------------
+NO = {
+    "Weekly plan": "Ukeplan",
+    "Timetable (*.timetable);;All files (*)": "Timeplan (*.timetable);;Alle filer (*)",
+    "Images (*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp);;All files (*)": "Bilder (*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp);;Alle filer (*)",
+    "Export HTML": "Eksporter HTML",
+    "Embed in the HTML file\nOne self-contained file, but larger.": "Bygg inn i HTML-filen\nÉn enkelt fil, men større.",
+    "Icon folder next to the file\nSmaller HTML. Keep the folder together with the file.": "Ikonmappe ved siden av filen\nMindre HTML. Behold mappen sammen med filen.",
+    "Day {n}": "Dag {n}",
+    "Column {letter}": "Kolonne {letter}",
+    "How should the icons be stored?": "Hvordan skal ikonene lagres?",
+    "Custom…": "Egendefinert …",
+    "Block colour": "Blokkfarge",
+    "Saved timespans": "Lagrede tidsrom",
+    "Add timespan": "Legg til tidsrom",
+    "e.g. Time 1": "f.eks. Time 1",
+    "Remove": "Fjern",
+    "Edit days": "Rediger dager",
+    "Columns within days": "Kolonner innad i dager",
+    "Title": "Tittel",
+    "Description": "Beskrivelse",
+    "Column": "Kolonne",
+    "Save…": "Lagre …",
+    "Save the current From/To as a timespan to pick later\n(manage them under Settings ▸ Saved timespans)": "Lagre gjeldende fra/til som et tidsrom du kan velge senere\n(administrer dem under Innstillinger ▸ Lagrede tidsrom)",
+    "Saved timespan": "Lagret tidsrom",
+    "Hide end time": "Skjul sluttid",
+    "Only the start time is printed; the end time still sets the block's size": "Bare starttiden skrives ut; sluttiden bestemmer fortsatt blokkens størrelse",
+    "Time": "Tid",
+    "Type or paste an emoji": "Skriv eller lim inn en emoji",
+    "Add image…": "Legg til bilde …",
+    "Icon": "Ikon",
+    "Colour": "Farge",
+    "Custom": "Egendefinert",
+    "Save timespan": "Lagre tidsrom",
+    "Right-click for options": "Høyreklikk for valg",
+    "Add icon images": "Legg til ikonbilder",
+    "Program settings": "Programinnstillinger",
+    "24-hour (13:00)": "24-timers (13:00)",
+    "12-hour (1:00 PM)": "12-timers (1:00 PM)",
+    "Clock": "Klokke",
+    "Check for new versions at startup": "Se etter nye versjoner ved oppstart",
+    "Asks github.com for the latest release when the program starts. Nothing else is sent.": "Spør github.com om siste versjon når programmet starter. Ingenting annet sendes.",
+    "Planner": "Ukeplan",
+    "Title shown at the top of the page": "Tittel som vises øverst på siden",
+    "Small note under the timetable (optional)": "Liten merknad under timeplanen (valgfritt)",
+    "Note": "Merknad",
+    "Paper": "Papir",
+    "Days": "Dager",
+    "Columns…": "Kolonner …",
+    "Split days into named columns, for example one per class": "Del dager inn i navngitte kolonner, for eksempel én per klasse",
+    "Automatic (fit to blocks)": "Automatisk (tilpass til blokkene)",
+    "Hours": "Timer",
+    "Blocks": "Blokker",
+    "Dismiss": "Lukk",
+    "New": "Ny",
+    "Open…": "Åpne …",
+    "Save": "Lagre",
+    "Save as…": "Lagre som …",
+    "Export PDF…": "Eksporter PDF …",
+    "Export PNG…": "Eksporter PNG …",
+    "Export HTML…": "Eksporter HTML …",
+    "Export SVG…": "Eksporter SVG …",
+    "Print…": "Skriv ut …",
+    "Undo": "Angre",
+    "Redo": "Gjør om",
+    "Add block…": "Legg til blokk …",
+    "Delete block": "Slett blokk",
+    "Quit": "Avslutt",
+    "Saved timespans…": "Lagrede tidsrom …",
+    "Columns within days…": "Kolonner innad i dager …",
+    "Edit days…": "Rediger dager …",
+    "Program settings…": "Programinnstillinger …",
+    "&File": "&Fil",
+    "&Edit": "&Rediger",
+    "&Settings": "&Innstillinger",
+    "Main": "Hovedverktøylinje",
+    "Untitled": "Uten navn",
+    "Unsaved changes": "Ulagrede endringer",
+    "Save changes to this planner?": "Lagre endringer i denne ukeplanen?",
+    "Open planner": "Åpne ukeplan",
+    "Save planner as": "Lagre ukeplan som",
+    "Export PDF": "Eksporter PDF",
+    "Export PNG": "Eksporter PNG",
+    "Export SVG": "Eksporter SVG",
+    "Share one folder ('{dir}') between timetables\nSeveral exports in the same place reuse the same icons.": "Del én mappe («{dir}») mellom timeplaner\nFlere eksporter på samme sted bruker de samme ikonene.",
+    "Name (optional)": "Navn (valgfritt)",
+    "From": "Fra",
+    "To": "Til",
+    "Add day": "Legg til dag",
+    "Move up": "Flytt opp",
+    "Move down": "Flytt ned",
+    "Reset to default week": "Tilbakestill til standarduke",
+    "A planner needs at least one day.": "En ukeplan må ha minst én dag.",
+    "Day": "Dag",
+    "Add column": "Legg til kolonne",
+    "Copy to all days": "Kopier til alle dager",
+    "Edit block": "Rediger blokk",
+    "New block": "Ny blokk",
+    "Day(s)": "Dag(er)",
+    "None": "Ingen",
+    "Emoji": "Emoji",
+    "Image file": "Bildefil",
+    "All columns": "Alle kolonner",
+    "The end time must be after the start time.": "Sluttiden må være etter starttiden.",
+    "This timespan is already saved.": "Dette tidsrommet er allerede lagret.",
+    "Only in this planner": "Bare i denne ukeplanen",
+    "Large image": "Stort bilde",
+    "Block": "Blokk",
+    "Please enter a title or a description.": "Skriv inn en tittel eller en beskrivelse.",
+    "Welcome! Choose your settings. You can change them later under Settings ▸ Program settings.": "Velkommen! Velg innstillinger. Du kan endre dem senere under Innstillinger ▸ Programinnstillinger.",
+    "Landscape": "Liggende",
+    "Portrait": "Stående",
+    "to": "til",
+    "Add…": "Legg til …",
+    "Edit…": "Rediger …",
+    "Duplicate": "Dupliser",
+    "Delete": "Slett",
+    "  (day hidden)": "  (dagen er skjult)",
+    "{t} means midnight (end of the day)": "{t} betyr midnatt (slutten av dagen)",
+    "Remove days": "Fjern dager",
+    "Remove columns": "Fjern kolonner",
+    "Name for {label} (optional):": "Navn på {label} (valgfritt):",
+    "Remove from my icons": "Fjern fra mine ikoner",
+    "Add to my icons": "Legg til i mine ikoner",
+    "They won't show if the planner is opened on another computer or if the image files are moved.": "De vises ikke hvis ukeplanen åpnes på en annen datamaskin eller hvis bildefilene flyttes.",
+    "Select at least one day.": "Velg minst én dag.",
+    "Open the downloads page": "Åpne nedlastingssiden",
+    "Open": "Åpne",
+    "Saved {path}": "Lagret {path}",
+    " — file not found": " – filen finnes ikke",
+    "  (stays in this planner)": "  (blir værende i denne ukeplanen)",
+    "Not added on {days}: no column with that name.": "Ikke lagt til på {days}: ingen kolonne med det navnet.",
+    "Open recent": "Åpne nylige",
+    "(no title)": "(uten tittel)",
+    "Exported {path}": "Eksportert {path}",
+    "Export": "Eksporter",
+    "Row {n}: the end time must be after the start time.": "Rad {n}: sluttiden må være etter starttiden.",
+    "{n} block on the removed days will be deleted (you can undo this). Continue?": "{n} blokk på de fjernede dagene blir slettet (du kan angre). Fortsette?",
+    "{n} blocks on the removed days will be deleted (you can undo this). Continue?": "{n} blokker på de fjernede dagene blir slettet (du kan angre). Fortsette?",
+    "{n} block in the removed columns will be deleted (you can undo this). Continue?": "{n} blokk i de fjernede kolonnene blir slettet (du kan angre). Fortsette?",
+    "{n} blocks in the removed columns will be deleted (you can undo this). Continue?": "{n} blokker i de fjernede kolonnene blir slettet (du kan angre). Fortsette?",
+    "Linked to {path} (too large to store inside the planner)": "Lenket til {path} (for stor til å lagres i ukeplanen)",
+    "{n} block (red dashed in the preview) doesn't have room for all its text. Shorten the text, give the block more time or width, narrow the hour range or switch to A3.": "{n} blokk (markert med rød stiplet kant i forhåndsvisningen) har ikke plass til all teksten. Kort ned teksten, gi blokken mer tid eller bredde, begrens tidsrommet eller bytt til A3.",
+    "{n} blocks (red dashed in the preview) don't have room for all their text. Shorten the text, give the block more time or width, narrow the hour range or switch to A3.": "{n} blokker (markert med rød stiplet kant i forhåndsvisningen) har ikke plass til all teksten. Kort ned teksten, gi blokkene mer tid eller bredde, begrens tidsrommet eller bytt til A3.",
+    "{n} block (marked with ! in the list) uses an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokk (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokken og velg ikonet på nytt.",
+    "{n} blocks (marked with ! in the list) use an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokker (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokkene og velg ikonet på nytt.",
+    "Clear menu": "Tøm menyen",
+    "No days selected": "Ingen dager valgt",
+    "This is not a Ukeplan file.": "Dette er ikke en Ukeplan-fil.",
+    "Could not read image: {err}": "Kunne ikke lese bildet: {err}",
+    "Could not open the file:\n{ex}": "Kunne ikke åpne filen:\n{ex}",
+    "Could not save:\n{ex}": "Kunne ikke lagre:\n{ex}",
+    "These images are too large to store inside the planner file, so the planner links to them instead:": "Disse bildene er for store til å lagres i ukeplanfilen, så ukeplanen lenker til dem i stedet:",
+    "A new version is available: {v} (you have {cur}).": "En ny versjon er tilgjengelig: {v} (du har {cur}).",
+    "Could not export:\n{ex}": "Kunne ikke eksportere:\n{ex}",
+}
+
 
 MM = 100                       # layout units per millimetre (1 unit = 0.01 mm)
 PAGES = {"A4": (210.0, 297.0), "A3": (297.0, 420.0)}   # portrait size in mm
@@ -73,13 +330,38 @@ def col_letters(i: int) -> str:
     return out
 
 
+def default_col_name(i: int) -> str:
+    return tr("Column {letter}").format(letter=col_letters(i))
+
+
 def col_names(names: list) -> list:
     """Names to show: a blank column gets the default 'Column A', 'Column B', ... by position."""
-    return [n.strip() or f"Column {col_letters(i)}" for i, n in enumerate(names)]
+    return [n.strip() or default_col_name(i) for i, n in enumerate(names)]
 
 
 def fmt_time(minutes: int) -> str:
-    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    if CLOCK24:
+        return f"{minutes // 60:02d}:{minutes % 60:02d}"
+    h = (minutes // 60) % 24
+    return f"{h % 12 or 12}:{minutes % 60:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def range_text(start: int, end: int) -> str:
+    """09:00–10:30, or 9:00–10:30 AM when both ends are in the same half of the day."""
+    if not CLOCK24 and (start // 60 % 24 < 12) == (end // 60 % 24 < 12):
+        a, b = fmt_time(start), fmt_time(end)
+        return f"{a.rsplit(' ', 1)[0]}–{b}"
+    return f"{fmt_time(start)}–{fmt_time(end)}"
+
+
+def hour_label(h: int) -> str:
+    if CLOCK24:
+        return f"{h:02d}:00"
+    return f"{h % 12 or 12} {'AM' if h % 24 < 12 else 'PM'}"
+
+
+def time_edit_format() -> str:
+    return "HH:mm" if CLOCK24 else "h:mm AP"
 
 
 @dataclass
@@ -116,7 +398,7 @@ class Event:
 
 @dataclass
 class Planner:
-    title: str = "Ukeplan"
+    title: str = field(default_factory=lambda: default_title())
     page: str = "A4"
     landscape: bool = True
     days: list = field(default_factory=lambda: [0, 1, 2, 3, 4])
@@ -125,17 +407,18 @@ class Planner:
     range_end: int = 16
     events: list = field(default_factory=list)
     subcols: dict = field(default_factory=dict)  # day -> [column names] (blank = default name)
-    day_names: list = field(default_factory=lambda: list(DAYS))   # the planner's days
+    day_names: list = field(default_factory=lambda: default_days())   # the planner's days
     note: str = ""               # small italic text printed under the timetable
     icons: dict = field(default_factory=dict)   # id -> base64 PNG
 
     def day_label(self, d: int) -> str:
-        return self.day_names[d] if 0 <= d < len(self.day_names) else f"Dag {d + 1}"
+        return self.day_names[d] if 0 <= d < len(self.day_names) else day_fallback(d)
 
     def day_short(self, d: int) -> str:
         name = self.day_label(d)
-        if d < len(DAYS) and name == DAYS[d]:
-            return DAYS_SHORT[d]
+        for full, short in DAYS_BY_LANG.values():
+            if d < len(full) and name == full[d]:
+                return short[d]
         return name if len(name) <= 6 else name[:5] + "…"
 
     def page_mm(self) -> tuple:
@@ -185,13 +468,13 @@ class Planner:
     @staticmethod
     def from_dict(d: dict) -> "Planner":
         if not isinstance(d, dict) or d.get("format") != "ukeplan":
-            raise ValueError("This is not a Ukeplan file.")
+            raise ValueError(tr("This is not a Ukeplan file."))
         events = [Event.from_dict(e) for e in d.get("events", [])]
-        names = [str(x) for x in d.get("day_names", DAYS)] or list(DAYS)
+        names = [str(x) for x in d.get("day_names", default_days())] or default_days()
         shown = [int(x) for x in d.get("days", [0, 1, 2, 3, 4]) if int(x) >= 0]
         need = max([e.day for e in events] + shown + [-1]) + 1
         while len(names) < need:                       # a file that uses days it doesn't name
-            names.append(f"Dag {len(names) + 1}")
+            names.append(day_fallback(len(names)))
         return Planner(
             title=str(d.get("title", "")),
             page=d.get("page", "A4") if d.get("page") in PAGES else "A4",
@@ -257,7 +540,7 @@ def load_icon_image(path: str, max_px: int = ICON_MAX_PX) -> QImage:
                                        max(1, round(size.height() * f))))
     img = reader.read()
     if img.isNull():
-        raise ValueError(f"Could not read image: {reader.errorString()}")
+        raise ValueError(tr("Could not read image: {err}").format(err=reader.errorString()))
     if max(img.width(), img.height()) > max_px:
         img = img.scaled(max_px, max_px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
     return img
@@ -290,6 +573,11 @@ class Prefs:
         self.path: Optional[str] = None
         self.time_presets: list = []       # [{"name": str, "start": min, "end": min}]
         self.icons: dict = {}              # id -> {"name", "data"(b64) | "path"}, oldest first
+        self.lang: Optional[str] = None    # None = follow the operating system
+        self.clock24: Optional[bool] = None
+        self.check_updates = False
+        self.dismissed_update = ""
+        self.setup_done = False
 
     def _file(self) -> str:
         if self.path:
@@ -303,6 +591,8 @@ class Prefs:
 
     def load(self) -> None:
         self.time_presets, self.icons = [], {}
+        self.lang, self.clock24, self.check_updates = None, None, False
+        self.dismissed_update, self.setup_done = "", False
         try:
             with open(self._file(), "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -318,6 +608,11 @@ class Prefs:
         for k, v in d.get("icons", {}).items():
             if isinstance(v, dict) and (isinstance(v.get("data"), str) or isinstance(v.get("path"), str)):
                 self.icons[str(k)] = v
+        self.lang = d.get("lang") if d.get("lang") in ("no", "en") else None
+        self.clock24 = d.get("clock24") if isinstance(d.get("clock24"), bool) else None
+        self.check_updates = bool(d.get("check_updates", False))
+        self.dismissed_update = str(d.get("dismissed_update", ""))
+        self.setup_done = bool(d.get("setup_done", False))
 
     def save(self) -> None:
         path = self._file()
@@ -325,11 +620,19 @@ class Prefs:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"time_presets": self.time_presets, "icons": self.icons},
+                json.dump({"time_presets": self.time_presets, "icons": self.icons,
+                           "lang": self.lang, "clock24": self.clock24,
+                           "check_updates": self.check_updates,
+                           "dismissed_update": self.dismissed_update, "setup_done": self.setup_done},
                           f, ensure_ascii=False, indent=1)
             os.replace(tmp, path)
         except OSError as ex:
             print(f"Could not save settings: {ex}", file=sys.stderr)
+
+    def set_app_settings(self, lang: str, clock24: bool, check_updates: bool) -> None:
+        self.lang, self.clock24, self.check_updates = lang, clock24, check_updates
+        self.setup_done = True
+        self.save()
 
     # -- time slots
     def set_time_presets(self, presets: list) -> None:
@@ -537,7 +840,7 @@ def draw_doc(p: QPainter, doc: QTextDocument, x: float, y: float, color: QColor)
 def time_text(ev: Event) -> str:
     if ev.hide_end:
         return fmt_time(ev.start)
-    return f"{fmt_time(ev.start)}–{fmt_time(ev.end)}"
+    return range_text(ev.start, ev.end)
 
 
 def _words_fit(text: str, px: float, bold: bool, width: float) -> bool:
@@ -908,9 +1211,9 @@ def paint(p: QPainter, pl: Planner, L: Layout, selected: Optional[str] = None,
         draw_doc(p, doc, L.left, L.bottom + 2.0 * MM * k, QColor("#4B5563"))
 
     if not L.days:
-        p.setFont(_fit_font("Ingen dager valgt", 5 * MM * k, False, L.W - 2 * L.m))
+        p.setFont(_fit_font(tr("No days selected"), 5 * MM * k, False, L.W - 2 * L.m))
         p.setPen(QColor("#6B7280"))
-        p.drawText(QRectF(0, 0, L.W, L.H), Qt.AlignCenter, "Ingen dager valgt")
+        p.drawText(QRectF(0, 0, L.W, L.H), Qt.AlignCenter, tr("No days selected"))
         return
 
     full_h = L.head_h + L.sub_h
@@ -930,7 +1233,7 @@ def paint(p: QPainter, pl: Planner, L: Layout, selected: Optional[str] = None,
         p.setFont(lab_font)
         p.setPen(ink)
         p.drawText(QRectF(L.m, y - 2.2 * MM * k, L.time_w - 1.8 * MM * k, 4.4 * MM * k),
-                   Qt.AlignRight | Qt.AlignVCenter, f"{h:02d}:00")
+                   Qt.AlignRight | Qt.AlignVCenter, hour_label(h))
         if h < L.hi and L.hour_h >= 9 * MM * k:
             pen = QPen(QColor("#D1D5DB"), 0.15 * MM * k)
             pen.setStyle(Qt.DotLine)
@@ -1042,6 +1345,38 @@ def icon_file_stem(key: str) -> str:
 SHARED_ICON_DIR = "ukeplan-ikoner"
 
 
+def export_svg(pl: Planner, path: str) -> None:
+    """Standalone .svg at the planner's paper size (mm), icons embedded. Same drawing code as the PDF."""
+    w_mm, h_mm = pl.page_mm()
+    W, H = w_mm * MM, h_mm * MM
+    buf = QBuffer()
+    buf.open(QIODevice.WriteOnly)
+    gen = QSvgGenerator()
+    gen.setOutputDevice(buf)
+    gen.setSize(QSize(int(W), int(H)))
+    gen.setViewBox(QRectF(0, 0, W, H))
+    gen.setTitle(pl.title or APP_NAME)
+    L = compute_layout(pl, W, H)
+    small = {}
+    for pb in L.placed:                                  # icons at up to 256 px: crisp, but not huge
+        if pb.img is not None:
+            if id(pb.img) not in small:
+                im = pb.img
+                if max(im.width(), im.height()) > 256:
+                    im = im.scaled(256, 256, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                small[id(pb.img)] = im
+            pb.img = small[id(pb.img)]
+    p = QPainter(gen)
+    paint(p, pl, L)
+    p.end()
+    buf.close()
+    svg = bytes(buf.data().data()).decode("utf-8")
+    svg = re.sub(r'(<svg\b[^>]*?)\swidth="[^"]*"([^>]*?)\sheight="[^"]*"',
+                 rf'\1\2 width="{w_mm:g}mm" height="{h_mm:g}mm"', svg, count=1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(svg)
+
+
 def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
     """HTML export: the page as vector graphics (same drawing code as the PDF), with print CSS so a
     browser prints it at the planner's paper size. icons="embed": one self-contained file;
@@ -1108,7 +1443,7 @@ def export_html(pl: Planner, path: str, icons: str = "embed") -> None:
         svg = re.sub(r'xlink:href="data:image/png;base64,([^"]*)"', to_file, svg)
     title = html_escape(pl.title or APP_NAME)
     doc = f"""<!DOCTYPE html>
-<html lang="nb">
+<html lang="{'nb' if LANG == 'no' else 'en'}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1140,16 +1475,16 @@ def ask_html_icons(parent) -> Optional[str]:
     """Ask how to store icons in an HTML export. Returns "embed", "folder", "shared" or None (cancelled)."""
     st = QSettings()
     dlg = QDialog(parent)
-    dlg.setWindowTitle("Export HTML")
+    dlg.setWindowTitle(tr("Export HTML"))
     lay = QVBoxLayout(dlg)
-    lay.addWidget(QLabel("How should the icons be stored?"))
-    r_embed = QRadioButton("Embed in the HTML file\nOne self-contained file, but larger.")
-    r_folder = QRadioButton("Icon folder next to the file\nSmaller HTML. Keep the folder together with the file.")
+    lay.addWidget(QLabel(tr("How should the icons be stored?")))
+    r_embed = QRadioButton(tr("Embed in the HTML file\nOne self-contained file, but larger."))
+    r_folder = QRadioButton(tr("Icon folder next to the file\nSmaller HTML. Keep the folder together with the file."))
     (r_folder if st.value("html_icons", "embed") == "folder" else r_embed).setChecked(True)
     lay.addWidget(r_embed)
     lay.addWidget(r_folder)
-    c_shared = QCheckBox(f"Share one folder ('{SHARED_ICON_DIR}') between timetables\n"
-                         "Several exports in the same place reuse the same icons.")
+    c_shared = QCheckBox(tr("Share one folder ('{dir}') between timetables\n"
+                         "Several exports in the same place reuse the same icons.").format(dir=SHARED_ICON_DIR))
     c_shared.setChecked(st.value("html_icons_shared", "false") in (True, "true"))
     c_shared.setEnabled(r_folder.isChecked())
     c_shared.setStyleSheet("margin-left: 22px;")
@@ -1264,6 +1599,29 @@ class Preview(QWidget):
 # --------------------------------------------------------------------------
 # Dialogs
 # --------------------------------------------------------------------------
+class HourSpin(QSpinBox):
+    """Whole hours, shown as 08:00 or 8 AM depending on the clock setting."""
+
+    def textFromValue(self, v: int) -> str:
+        return hour_label(v)
+
+    def valueFromText(self, text: str) -> int:
+        m = re.search(r"\d+", text)
+        if not m:
+            return self.value()
+        n = int(m.group())
+        low = text.lower()
+        if "p" in low and n < 12:
+            n += 12
+        elif "a" in low and n == 12:
+            n = 0 if self.minimum() == 0 else 24
+        return max(self.minimum(), min(self.maximum(), n))
+
+    def validate(self, text: str, pos: int):
+        return QValidator.Acceptable if re.fullmatch(r"\s*\d{0,2}\s*(:\s*0{0,2})?\s*([aApP][mM]?)?\s*", text) \
+            else QValidator.Invalid, text, pos
+
+
 class ColorRow(QWidget):
     def __init__(self, color: str):
         super().__init__()
@@ -1278,7 +1636,7 @@ class ColorRow(QWidget):
             b.clicked.connect(lambda _=False, c=c: self.set_color(c))
             grid.addWidget(b, i // 6, i % 6)
             self.btns.append((b, c))
-        self.custom = QPushButton("Custom…")
+        self.custom = QPushButton(tr("Custom…"))
         self.custom.clicked.connect(self.pick)
         grid.addWidget(self.custom, 0, 6, 2, 1)
         self.restyle()
@@ -1298,12 +1656,11 @@ class ColorRow(QWidget):
         self.restyle()
 
     def pick(self):
-        c = QColorDialog.getColor(QColor(self.color), self, "Block colour")
+        c = QColorDialog.getColor(QColor(self.color), self, tr("Block colour"))
         if c.isValid():
             self.set_color(c.name())
 
 
-ICON_FILE_FILTER = "Images (*.png *.jpg *.jpeg *.gif *.bmp *.svg *.webp);;All files (*)"
 
 
 def qtime_from_minutes(m: int) -> QTime:
@@ -1316,7 +1673,7 @@ def minutes_from_qtime(t: QTime, is_end: bool = False) -> int:
 
 
 def slot_label(p: dict) -> str:
-    base = f"{fmt_time(p['start'])}–{fmt_time(p['end'])}"
+    base = range_text(p["start"], p["end"])
     return f"{base}  ·  {p['name']}" if p.get("name") else base
 
 
@@ -1325,10 +1682,10 @@ class TimeSlotsDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Saved timespans")
+        self.setWindowTitle(tr("Saved timespans"))
         lay = QVBoxLayout(self)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name (optional)", "From", "To", ""])
+        self.table.setHorizontalHeaderLabels([tr("Name (optional)"), tr("From"), tr("To"), ""])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         hh = self.table.horizontalHeader()
@@ -1341,7 +1698,7 @@ class TimeSlotsDialog(QDialog):
         for p in PREFS.time_presets:
             self.add_row(p["name"], p["start"], p["end"])
         row = QHBoxLayout()
-        add = QPushButton("Add timespan")
+        add = QPushButton(tr("Add timespan"))
         add.clicked.connect(lambda: self.add_row())
         row.addWidget(add)
         row.addStretch(1)
@@ -1368,13 +1725,13 @@ class TimeSlotsDialog(QDialog):
                 start, end = 8 * 60, 9 * 60
         self.table.insertRow(n)
         name_edit = QLineEdit(name)
-        name_edit.setPlaceholderText("e.g. Time 1")
+        name_edit.setPlaceholderText(tr("e.g. Time 1"))
         t1, t2 = QTimeEdit(qtime_from_minutes(start)), QTimeEdit(qtime_from_minutes(end))
         for t in (t1, t2):
-            t.setDisplayFormat("HH:mm")
-        t2.setToolTip("00:00 means midnight (end of the day)")
+            t.setDisplayFormat(time_edit_format())
+        t2.setToolTip(tr("{t} means midnight (end of the day)").format(t=fmt_time(0)))
         rm = QPushButton("✕")
-        rm.setToolTip("Remove")
+        rm.setToolTip(tr("Remove"))
         rm.clicked.connect(self.remove_clicked)
         for c, w in enumerate((name_edit, t1, t2, rm)):
             self.table.setCellWidget(n, c, w)
@@ -1391,8 +1748,8 @@ class TimeSlotsDialog(QDialog):
         for r in range(self.table.rowCount()):
             sm, em = self.row_times(r)
             if em <= sm:
-                QMessageBox.warning(self, "Saved timespans",
-                                    f"Row {r + 1}: the end time must be after the start time.")
+                QMessageBox.warning(self, tr("Saved timespans"),
+                                    tr("Row {n}: the end time must be after the start time.").format(n=r + 1))
                 return
             if (sm, em) in seen:
                 continue
@@ -1407,7 +1764,7 @@ class DaysDialog(QDialog):
 
     def __init__(self, parent, pl: Planner):
         super().__init__(parent)
-        self.setWindowTitle("Edit days")
+        self.setWindowTitle(tr("Edit days"))
         self.pl = pl
         self.names: list = []
         self.mapping: dict = {}       # old day index -> new index (removed days are missing)
@@ -1422,9 +1779,9 @@ class DaysDialog(QDialog):
             self.add_item(i, n)
         body.addWidget(self.list, 1)
         side = QVBoxLayout()
-        for text, fn in (("Add day", self.add_day), ("Remove", self.remove_day),
-                         ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
-                         ("Reset to Mandag–Søndag", self.reset_week)):
+        for text, fn in ((tr("Add day"), self.add_day), (tr("Remove"), self.remove_day),
+                         (tr("Move up"), lambda: self.move(-1)), (tr("Move down"), lambda: self.move(1)),
+                         (tr("Reset to default week"), self.reset_week)):
             b = QPushButton(text)
             b.clicked.connect(lambda _=False, fn=fn: fn())
             side.addWidget(b)
@@ -1450,7 +1807,7 @@ class DaysDialog(QDialog):
 
     def add_day(self):
         used = set(self.texts())
-        name = next((d for d in DAYS if d not in used), f"Dag {self.list.count() + 1}")
+        name = next((d for d in default_days() if d not in used), day_fallback(self.list.count()))
         it = self.add_item(-1, name)
         self.list.setCurrentItem(it)
         self.list.editItem(it)
@@ -1471,18 +1828,18 @@ class DaysDialog(QDialog):
     def reset_week(self):
         old_n = len(self.pl.day_names)
         self.list.clear()
-        for i, name in enumerate(DAYS):             # keep blocks on days 1-7 where they exist
+        for i, name in enumerate(default_days()):   # keep blocks on days 1-7 where they exist
             self.add_item(i if i < old_n else -1, name)
 
     def accept(self):
         n = self.list.count()
         if n == 0:
-            QMessageBox.warning(self, "Edit days", "A planner needs at least one day.")
+            QMessageBox.warning(self, tr("Edit days"), tr("A planner needs at least one day."))
             return
         names, mapping, added = [], {}, []
         for i in range(n):
             it = self.list.item(i)
-            names.append(it.text().strip() or f"Dag {i + 1}")
+            names.append(it.text().strip() or day_fallback(i))
             orig = it.data(Qt.UserRole)
             if orig >= 0:
                 mapping[orig] = i
@@ -1490,9 +1847,9 @@ class DaysDialog(QDialog):
                 added.append(i)
         lost = sum(1 for e in self.pl.events if e.day not in mapping)
         if lost and QMessageBox.question(
-                self, "Remove days",
-                f"{lost} block{'s' if lost != 1 else ''} on the removed days will be deleted "
-                "(you can undo this). Continue?") != QMessageBox.Yes:
+                self, tr("Remove days"),
+                trn(lost, "{n} block on the removed days will be deleted (you can undo this). Continue?",
+                    "{n} blocks on the removed days will be deleted (you can undo this). Continue?").format(n=lost)) != QMessageBox.Yes:
             return
         self.names, self.mapping, self.added = names, mapping, added
         super().accept()
@@ -1512,7 +1869,7 @@ class ColumnsDialog(QDialog):
 
     def __init__(self, parent, pl: Planner):
         super().__init__(parent)
-        self.setWindowTitle("Columns within days")
+        self.setWindowTitle(tr("Columns within days"))
         self.pl = pl
         # working copy per day: [original column index or -1, name]
         self.work = {d: [[i, n] for i, n in enumerate(pl.subcols.get(d, []))]
@@ -1523,7 +1880,7 @@ class ColumnsDialog(QDialog):
 
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
-        top.addWidget(QLabel("Day"))
+        top.addWidget(QLabel(tr("Day")))
         self.day_combo = QComboBox()
         for d in sorted(set(pl.days) | {d for d, n in pl.subcols.items() if n}):
             self.day_combo.addItem(pl.day_label(d), d)
@@ -1538,9 +1895,9 @@ class ColumnsDialog(QDialog):
         self.list.itemChanged.connect(self.on_changed)
         body.addWidget(self.list, 1)
         side = QVBoxLayout()
-        for text, fn in (("Add column", self.add_col), ("Remove", self.remove_col),
-                         ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
-                         ("Copy to all days", self.copy_all)):
+        for text, fn in ((tr("Add column"), self.add_col), (tr("Remove"), self.remove_col),
+                         (tr("Move up"), lambda: self.move(-1)), (tr("Move down"), lambda: self.move(1)),
+                         (tr("Copy to all days"), self.copy_all)):
             b = QPushButton(text)
             b.clicked.connect(lambda _=False, fn=fn: fn())
             side.addWidget(b)
@@ -1573,7 +1930,7 @@ class ColumnsDialog(QDialog):
             it = self.list.item(i)
             auto = bool(it.data(Qt.UserRole + 1))
             if auto:
-                it.setText(f"Column {col_letters(i)}")
+                it.setText(default_col_name(i))
             f = it.font()
             f.setItalic(auto)
             it.setFont(f)
@@ -1648,9 +2005,9 @@ class ColumnsDialog(QDialog):
                 orphans += sum(1 for e in self.pl.events
                                if e.day == d and 0 <= e.col < old_n and e.col not in remap[d])
         if orphans and QMessageBox.question(
-                self, "Remove columns",
-                f"{orphans} block{'s' if orphans != 1 else ''} in the removed columns will be deleted "
-                "(you can undo this). Continue?") != QMessageBox.Yes:
+                self, tr("Remove columns"),
+                trn(orphans, "{n} block in the removed columns will be deleted (you can undo this). Continue?",
+                    "{n} blocks in the removed columns will be deleted (you can undo this). Continue?").format(n=orphans)) != QMessageBox.Yes:
             return
         self.new_subcols, self.remap = subcols, remap
         super().accept()
@@ -1664,7 +2021,7 @@ class EventDialog(QDialog):
         self.pl = pl
         self.settings = QSettings("Ukeplan", "Ukeplan")
         self.editing = ev is not None
-        self.setWindowTitle("Edit block" if self.editing else "New block")
+        self.setWindowTitle(tr("Edit block") if self.editing else tr("New block"))
         if ev is None:
             d = day if day is not None else (pl.days[0] if pl.days else 0)
             s = start if start is not None else 9 * 60
@@ -1677,17 +2034,17 @@ class EventDialog(QDialog):
 
         form = QFormLayout()
         self.title = QLineEdit(ev.title)
-        form.addRow("Title", self.title)
+        form.addRow(tr("Title"), self.title)
         self.desc = QPlainTextEdit(ev.description)
         self.desc.setMinimumHeight(90)
-        form.addRow("Description", self.desc)
+        form.addRow(tr("Description"), self.desc)
 
         if self.editing:
             self.day_combo = QComboBox()
             for d in sorted(set(pl.days) | {ev.day}):
                 self.day_combo.addItem(pl.day_label(d), d)
             self.day_combo.setCurrentIndex(self.day_combo.findData(ev.day))
-            form.addRow("Day", self.day_combo)
+            form.addRow(tr("Day"), self.day_combo)
         else:
             row = QHBoxLayout()
             self.day_boxes = []
@@ -1700,14 +2057,14 @@ class EventDialog(QDialog):
             w = QWidget()
             w.setLayout(row)
             row.setContentsMargins(0, 0, 0, 0)
-            form.addRow("Day(s)", w)
+            form.addRow(tr("Day(s)"), w)
 
         # column within the day (only shown for days that are split into columns)
         self.form = form
         self.col_combo = QComboBox()
         self._col_opts: list = []
         self._wanted_col = ev.col if self.editing else (col if col is not None else -1)
-        form.addRow("Column", self.col_combo)
+        form.addRow(tr("Column"), self.col_combo)
         if self.editing:
             self.day_combo.currentIndexChanged.connect(lambda *_: self.refresh_cols())
         else:
@@ -1719,48 +2076,48 @@ class EventDialog(QDialog):
         srow = QHBoxLayout()
         self.preset = QComboBox()
         self.preset.activated.connect(self.on_preset)
-        self.save_slot_btn = QPushButton("Save…")
-        self.save_slot_btn.setToolTip("Save the current From/To as a timespan to pick later\n"
-                                      "(manage them under Settings ▸ Saved timespans)")
+        self.save_slot_btn = QPushButton(tr("Save…"))
+        self.save_slot_btn.setToolTip(tr("Save the current From/To as a timespan to pick later\n"
+                                      "(manage them under Settings ▸ Saved timespans)"))
         self.save_slot_btn.clicked.connect(self.save_slot)
         srow.addWidget(self.preset, 1)
         srow.addWidget(self.save_slot_btn)
         sw = QWidget()
         sw.setLayout(srow)
         srow.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Saved timespan", sw)
+        form.addRow(tr("Saved timespan"), sw)
 
         times = QHBoxLayout()
         self.start = QTimeEdit(qtime_from_minutes(ev.start))
         self.end = QTimeEdit(qtime_from_minutes(ev.end))
         for t in (self.start, self.end):
-            t.setDisplayFormat("HH:mm")
+            t.setDisplayFormat(time_edit_format())
             t.timeChanged.connect(self.sync_preset)
-        self.end.setToolTip("00:00 means midnight (end of the day)")
-        times.addWidget(QLabel("From"))
+        self.end.setToolTip(tr("{t} means midnight (end of the day)").format(t=fmt_time(0)))
+        times.addWidget(QLabel(tr("From")))
         times.addWidget(self.start)
         times.addSpacing(12)
-        times.addWidget(QLabel("To"))
+        times.addWidget(QLabel(tr("To")))
         times.addWidget(self.end)
         times.addSpacing(12)
-        self.hide_end = QCheckBox("Hide end time")
+        self.hide_end = QCheckBox(tr("Hide end time"))
         self.hide_end.setChecked(ev.hide_end)
-        self.hide_end.setToolTip("Only the start time is printed; the end time still sets the block's size")
+        self.hide_end.setToolTip(tr("Only the start time is printed; the end time still sets the block's size"))
         times.addWidget(self.hide_end)
         times.addStretch(1)
         tw = QWidget()
         tw.setLayout(times)
         times.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Time", tw)
+        form.addRow(tr("Time"), tw)
         self.fill_presets()
 
         # icon: none / emoji / image file (with remembered images)
         top = QHBoxLayout()
         self.icon_mode = QComboBox()
-        self.icon_mode.addItems(["None", "Emoji", "Image file"])
+        self.icon_mode.addItems([tr("None"), tr("Emoji"), tr("Image file")])
         self.emoji_edit = QLineEdit(ev.icon[6:] if ev.icon.startswith("emoji:") else "")
-        self.emoji_edit.setPlaceholderText("Type or paste an emoji")
-        self.add_img_btn = QPushButton("Add image…")
+        self.emoji_edit.setPlaceholderText(tr("Type or paste an emoji"))
+        self.add_img_btn = QPushButton(tr("Add image…"))
         self.icon_preview = QLabel()
         self.icon_preview.setFixedSize(38, 38)
         self.icon_preview.setAlignment(Qt.AlignCenter)
@@ -1793,7 +2150,7 @@ class EventDialog(QDialog):
         iw = QWidget()
         iw.setLayout(ibox)
         iw.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)   # spare height goes to the description
-        form.addRow("Icon", iw)
+        form.addRow(tr("Icon"), iw)
         self.icon_mode.setCurrentIndex(1 if ev.icon.startswith("emoji:") else 2 if self.file_key else 0)
         self.icon_mode.currentIndexChanged.connect(self.update_icon_ui)
         self.emoji_edit.textEdited.connect(self.on_emoji_edited)
@@ -1802,7 +2159,7 @@ class EventDialog(QDialog):
         self.update_icon_ui()
 
         self.colors = ColorRow(ev.color)
-        form.addRow("Colour", self.colors)
+        form.addRow(tr("Colour"), self.colors)
 
         lay = QVBoxLayout(self)
         lay.addLayout(form)
@@ -1822,7 +2179,7 @@ class EventDialog(QDialog):
     def refresh_cols(self, first: bool = False):
         days = self.ticked_days()
         prev = None if first else self.col_combo.currentText()
-        opts = [("All columns", lambda d: -1)]
+        opts = [(tr("All columns"), lambda d: -1)]
         if len(days) == 1:
             for i, nm in enumerate(col_names(self.pl.subcols.get(days[0], []))):
                 opts.append((nm, lambda d, i=i: i))
@@ -1858,7 +2215,7 @@ class EventDialog(QDialog):
         self.preset.blockSignals(True)
         self.preset.clear()
         self._preset_vals = []
-        self.preset.addItem("Custom", -1)
+        self.preset.addItem(tr("Custom"), -1)
         for p in PREFS.time_presets:
             self.preset.addItem(slot_label(p), len(self._preset_vals))
             self._preset_vals.append((p["start"], p["end"]))
@@ -1891,13 +2248,13 @@ class EventDialog(QDialog):
     def save_slot(self):
         sm, em = self.times()
         if em <= sm:
-            QMessageBox.warning(self, "Time", "The end time must be after the start time.")
+            QMessageBox.warning(self, tr("Time"), tr("The end time must be after the start time."))
             return
         if any(p["start"] == sm and p["end"] == em for p in PREFS.time_presets):
-            QMessageBox.information(self, "Saved timespan", "This timespan is already saved.")
+            QMessageBox.information(self, tr("Saved timespan"), tr("This timespan is already saved."))
             return
-        label = f"{fmt_time(sm)}–{fmt_time(em)}"
-        name, ok = QInputDialog.getText(self, "Save timespan", f"Name for {label} (optional):")
+        label = range_text(sm, em)
+        name, ok = QInputDialog.getText(self, tr("Save timespan"), tr("Name for {label} (optional):").format(label=label))
         if not ok:
             return
         PREFS.set_time_presets(PREFS.time_presets + [{"name": name.strip(), "start": sm, "end": em}])
@@ -1962,13 +2319,13 @@ class EventDialog(QDialog):
         e = PREFS.icons.get(iid)
         v = self.pl.icons.get(iid)
         path = (e or {}).get("path") or (v.get("path") if isinstance(v, dict) else "")
-        parts = [(e or {}).get("name") or "Icon"]
+        parts = [(e or {}).get("name") or tr("Icon")]
         if path:
-            parts.append(f"Linked to {path} (too large to store inside the planner)"
-                         + ("" if os.path.isfile(path) else " — file not found"))
+            parts.append(tr("Linked to {path} (too large to store inside the planner)").format(path=path)
+                         + ("" if os.path.isfile(path) else tr(" — file not found")))
         if e is None:
-            parts.append("Only in this planner")
-        parts.append("Right-click for options")
+            parts.append(tr("Only in this planner"))
+        parts.append(tr("Right-click for options"))
         return "\n".join(parts)
 
     def populate_gallery(self):
@@ -1996,10 +2353,10 @@ class EventDialog(QDialog):
         menu = QMenu(self)
         if iid in PREFS.icons:
             stays = iid in self.pl.used_icon_ids()
-            act = menu.addAction("Remove from my icons" + ("  (stays in this planner)" if stays else ""))
+            act = menu.addAction(tr("Remove from my icons") + (tr("  (stays in this planner)") if stays else ""))
             act.triggered.connect(lambda *_: self.remove_icon(iid))
         elif iid in self.pl.icons:
-            act = menu.addAction("Add to my icons")
+            act = menu.addAction(tr("Add to my icons"))
             act.triggered.connect(lambda *_: self.add_to_my_icons(iid))
         else:
             return
@@ -2019,7 +2376,7 @@ class EventDialog(QDialog):
 
     def add_images(self):
         last = self.settings.value("last_icon_dir", "", type=str)
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add icon images", last, ICON_FILE_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(self, tr("Add icon images"), last, icon_file_filter())
         if not paths:
             return
         self.settings.setValue("last_icon_dir", os.path.dirname(paths[0]))
@@ -2038,14 +2395,14 @@ class EventDialog(QDialog):
         self.populate_gallery()
         self.update_icon_preview()
         if errors:
-            QMessageBox.warning(self, "Icon", "\n".join(errors))
+            QMessageBox.warning(self, tr("Icon"), "\n".join(errors))
         if linked:
             QMessageBox.information(
-                self, "Large image",
-                "These images are too large to store inside the planner file, so the planner "
-                "links to them instead:\n\n• " + "\n• ".join(linked) +
-                "\n\nThey won't show if the planner is opened on another computer "
-                "or if the image files are moved.")
+                self, tr("Large image"),
+                tr("These images are too large to store inside the planner file, so the planner "
+                   "links to them instead:") + "\n\n• " + "\n• ".join(linked) +
+                "\n\n" + tr("They won't show if the planner is opened on another computer "
+                            "or if the image files are moved."))
 
     # ---- accept ----------------------------------------------------------------
     def accept(self):
@@ -2053,17 +2410,17 @@ class EventDialog(QDialog):
         desc = self.desc.toPlainText().strip()
         sm, em = self.times()
         if em <= sm:
-            QMessageBox.warning(self, "Time", "The end time must be after the start time.")
+            QMessageBox.warning(self, tr("Time"), tr("The end time must be after the start time."))
             return
         if not title and not desc:
-            QMessageBox.warning(self, "Block", "Please enter a title or a description.")
+            QMessageBox.warning(self, tr("Block"), tr("Please enter a title or a description."))
             return
         if self.editing:
             days = [self.day_combo.currentData()]
         else:
             days = [d for d, cb in self.day_boxes if cb.isChecked()]
             if not days:
-                QMessageBox.warning(self, "Day", "Select at least one day.")
+                QMessageBox.warning(self, tr("Day"), tr("Select at least one day."))
                 return
         key = self.current_icon_key()
         out = []
@@ -2082,8 +2439,7 @@ class EventDialog(QDialog):
             out.append(ev)
         self.result_events = out
         if skipped:
-            QMessageBox.information(self, "Column", "Not added on " + ", ".join(skipped) +
-                                    ": no column with that name.")
+            QMessageBox.information(self, tr("Column"), tr("Not added on {days}: no column with that name.").format(days=", ".join(skipped)))
         if key.startswith("img:"):
             PREFS.touch_icon(key[4:])
         super().accept()
@@ -2092,7 +2448,66 @@ class EventDialog(QDialog):
 # --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
+class AppSettingsDialog(QDialog):
+    """Program settings: language, clock and the update check. Opens by itself on first launch."""
+
+    def __init__(self, parent=None, first_run: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle(tr("Program settings"))
+        lay = QVBoxLayout(self)
+        if first_run:
+            hello = QLabel(tr("Welcome! Choose your settings. You can change them later under Settings ▸ Program settings."))
+            hello.setWordWrap(True)
+            lay.addWidget(hello)
+        form = QFormLayout()
+        self.lang = QComboBox()
+        self.lang.addItem("Norsk", "no")
+        self.lang.addItem("English", "en")
+        self.lang.setCurrentIndex(0 if LANG == "no" else 1)
+        form.addRow("Språk / Language", self.lang)
+        self.clock = QComboBox()
+        self.clock.addItem(tr("24-hour (13:00)"), True)
+        self.clock.addItem(tr("12-hour (1:00 PM)"), False)
+        self.clock.setCurrentIndex(0 if CLOCK24 else 1)
+        form.addRow(tr("Clock"), self.clock)
+        lay.addLayout(form)
+        self.updates = QCheckBox(tr("Check for new versions at startup"))
+        self.updates.setChecked(PREFS.check_updates)
+        self.updates.setToolTip(tr("Asks github.com for the latest release when the program starts. Nothing else is sent."))
+        lay.addWidget(self.updates)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def values(self) -> tuple:
+        return self.lang.currentData(), self.clock.currentData(), self.updates.isChecked()
+
+
+def parse_version(v: str) -> tuple:
+    nums = re.findall(r"\d+", v.split("-")[0])
+    return tuple(int(x) for x in nums)
+
+
+def is_newer(latest: str, current: str) -> bool:
+    a, b = parse_version(latest), parse_version(current)
+    return bool(a) and bool(b) and a > b
+
+
+def fetch_latest_version() -> Optional[str]:
+    """Tag name of the latest GitHub release (e.g. 'v1.2'), or None if it can't be fetched."""
+    try:
+        req = urllib.request.Request(LATEST_API, headers={"Accept": "application/vnd.github+json",
+                                                          "User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return str(json.load(r).get("tag_name") or "") or None
+    except Exception:
+        return None
+
+
 class MainWindow(QMainWindow):
+    updateFound = Signal(str)
+
     def __init__(self, path: Optional[str] = None):
         super().__init__()
         self.settings = QSettings("Ukeplan", "Ukeplan")
@@ -2107,11 +2522,80 @@ class MainWindow(QMainWindow):
         self.L: Optional[Layout] = None
         self._bad_icon_events: set = set()
         self.resize(1280, 800)
+        self._update_version = ""
+        self._actions: list = []
+        self.updateFound.connect(self.on_update_found)
         self._build_ui()
         self._build_actions()
         if path:
             self.load_path(path)
         self.refresh()
+        if PREFS.check_updates:
+            self.check_for_updates()
+        if not PREFS.setup_done:
+            QTimer.singleShot(0, lambda: self.open_app_settings(first_run=True))
+
+    # ---- program settings, language, updates --------------------------------
+    def open_app_settings(self, first_run: bool = False):
+        dlg = AppSettingsDialog(self, first_run)
+        if dlg.exec() == QDialog.Accepted:
+            lang, clock24, updates = dlg.values()
+            was_checking = PREFS.check_updates
+            PREFS.set_app_settings(lang, clock24, updates)
+            apply_settings()
+            install_qt_translations(QApplication.instance())
+            self.retranslate()
+            if updates and not was_checking:
+                self.check_for_updates()
+            elif not updates:
+                self._update_version = ""
+                self.show_update_bar()
+        elif first_run:
+            PREFS.set_app_settings(LANG, CLOCK24, False)     # keep what the OS gave us, don't ask again
+
+    def retranslate(self):
+        """Rebuild the window's text after the language or clock changed (the planner is kept as is)."""
+        for a in self._actions:
+            a.setShortcut("")
+            a.deleteLater()
+        self._actions = []
+        self.menuBar().clear()
+        for tb in self.findChildren(QToolBar):
+            self.removeToolBar(tb)
+            tb.deleteLater()
+        self._build_ui()
+        self._build_actions()
+        self.refresh()
+
+    def check_for_updates(self):
+        def work():
+            tag = fetch_latest_version()
+            if tag:
+                self.updateFound.emit(tag)
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_found(self, tag: str):
+        if not PREFS.check_updates or VERSION == "dev" or not is_newer(tag, VERSION):
+            return
+        if PREFS.dismissed_update == tag:
+            return
+        self._update_version = tag
+        self.show_update_bar()
+
+    def show_update_bar(self):
+        if not self._update_version:
+            self.update_bar.hide()
+            return
+        self.update_label.setText(
+            tr("A new version is available: {v} (you have {cur}).").format(v=self._update_version, cur=VERSION)
+            + f' <a href="{RELEASES_URL}">' + tr("Open the downloads page") + "</a>")
+        self.update_bar.show()
+
+    def dismiss_update(self):
+        PREFS.dismissed_update = self._update_version
+        PREFS.save()
+        self._update_version = ""
+        self.show_update_bar()
 
     # ---- UI ------------------------------------------------------------
     def _build_ui(self):
@@ -2122,56 +2606,55 @@ class MainWindow(QMainWindow):
         sl = QVBoxLayout(side)
         sl.setContentsMargins(0, 0, 0, 0)
 
-        box = QGroupBox("Planner")
+        box = QGroupBox(tr("Planner"))
         form = QFormLayout(box)
         self.title_edit = QLineEdit()
-        self.title_edit.setPlaceholderText("Title shown at the top of the page")
+        self.title_edit.setPlaceholderText(tr("Title shown at the top of the page"))
         self.title_edit.textEdited.connect(self.on_title)
         self.title_edit.editingFinished.connect(lambda: setattr(self, "_title_undo_pushed", False))
-        form.addRow("Title", self.title_edit)
+        form.addRow(tr("Title"), self.title_edit)
         self.note_edit = NoteEdit()
-        self.note_edit.setPlaceholderText("Small note under the timetable (optional)")
+        self.note_edit.setPlaceholderText(tr("Small note under the timetable (optional)"))
         self.note_edit.setFixedHeight(62)
         self.note_edit.textChanged.connect(self.on_note)
         self.note_edit.editingFinished.connect(lambda: setattr(self, "_note_undo_pushed", False))
-        form.addRow("Note", self.note_edit)
+        form.addRow(tr("Note"), self.note_edit)
         prow = QHBoxLayout()
         self.page_combo = QComboBox()
         self.page_combo.addItems(list(PAGES))
         self.page_combo.currentIndexChanged.connect(self.on_page)
         self.orient_combo = QComboBox()
-        self.orient_combo.addItems(["Landscape", "Portrait"])
+        self.orient_combo.addItems([tr("Landscape"), tr("Portrait")])
         self.orient_combo.currentIndexChanged.connect(self.on_page)
         prow.addWidget(self.page_combo)
         prow.addWidget(self.orient_combo)
-        form.addRow("Paper", prow)
+        form.addRow(tr("Paper"), prow)
 
         self.day_grid = QGridLayout()
         self.day_boxes = []
-        form.addRow("Days", self.day_grid)
+        form.addRow(tr("Days"), self.day_grid)
         self.rebuild_day_boxes()
-        self.cols_btn = QPushButton("Columns…")
-        self.cols_btn.setToolTip("Split days into named columns, for example one per class")
+        self.cols_btn = QPushButton(tr("Columns…"))
+        self.cols_btn.setToolTip(tr("Split days into named columns, for example one per class"))
         self.cols_btn.clicked.connect(self.edit_columns)
         form.addRow("", self.cols_btn)
 
-        self.auto_chk = QCheckBox("Automatic (fit to blocks)")
+        self.auto_chk = QCheckBox(tr("Automatic (fit to blocks)"))
         self.auto_chk.toggled.connect(self.on_range)
-        form.addRow("Hours", self.auto_chk)
+        form.addRow(tr("Hours"), self.auto_chk)
         rrow = QHBoxLayout()
-        self.from_spin, self.to_spin = QSpinBox(), QSpinBox()
+        self.from_spin, self.to_spin = HourSpin(), HourSpin()
         self.from_spin.setRange(0, 23)
         self.to_spin.setRange(1, 24)
         for sp in (self.from_spin, self.to_spin):
-            sp.setSuffix(":00")
             sp.valueChanged.connect(self.on_range)
         rrow.addWidget(self.from_spin)
-        rrow.addWidget(QLabel("to"))
+        rrow.addWidget(QLabel(tr("to")))
         rrow.addWidget(self.to_spin)
         form.addRow("", rrow)
         sl.addWidget(box)
 
-        ebox = QGroupBox("Blocks")
+        ebox = QGroupBox(tr("Blocks"))
         el = QVBoxLayout(ebox)
         self.listw = QListWidget()
         self.listw.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -2179,8 +2662,8 @@ class MainWindow(QMainWindow):
         self.listw.itemDoubleClicked.connect(lambda it: self.edit_event(it.data(Qt.UserRole)))
         el.addWidget(self.listw, 1)
         brow = QHBoxLayout()
-        for text, fn in (("Add…", lambda: self.add_event()), ("Edit…", lambda: self.edit_event()),
-                         ("Duplicate", self.duplicate_event), ("Delete", self.delete_event)):
+        for text, fn in ((tr("Add…"), lambda: self.add_event()), (tr("Edit…"), lambda: self.edit_event()),
+                         (tr("Duplicate"), self.duplicate_event), (tr("Delete"), self.delete_event)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             brow.addWidget(b)
@@ -2197,51 +2680,79 @@ class MainWindow(QMainWindow):
         self.preview.cellDoubleClicked.connect(lambda d, m, c: self.add_event(day=d, start=m, col=c))
         root.addWidget(side)
         root.addWidget(self.preview, 1)
-        self.setCentralWidget(central)
+        self.update_bar = QFrame()
+        self.update_bar.setStyleSheet("QFrame { background:#DBEAFE; border-bottom:1px solid #93C5FD; }"
+                                      "QLabel { color:#1E3A8A; }")
+        ub = QHBoxLayout(self.update_bar)
+        ub.setContentsMargins(12, 4, 6, 4)
+        self.update_label = QLabel()
+        self.update_label.setOpenExternalLinks(True)
+        ub.addWidget(self.update_label, 1)
+        close = QToolButton()
+        close.setText("✕")
+        close.setAutoRaise(True)
+        close.setToolTip(tr("Dismiss"))
+        close.clicked.connect(self.dismiss_update)
+        ub.addWidget(close)
+        self.update_bar.hide()
+        outer = QWidget()
+        ol = QVBoxLayout(outer)
+        ol.setContentsMargins(0, 0, 0, 0)
+        ol.setSpacing(0)
+        ol.addWidget(self.update_bar)
+        ol.addWidget(central, 1)
+        self.setCentralWidget(outer)
+        self.show_update_bar()
 
     def _build_actions(self):
         def act(text, slot, shortcut=None, icon_text=None):
             a = QAction(text, self)
+            self._actions.append(a)
             a.triggered.connect(slot)
             if shortcut:
                 a.setShortcut(shortcut)
             return a
-        self.a_new = act("New", self.new_planner, QKeySequence.New)
-        self.a_open = act("Open…", self.open_planner, QKeySequence.Open)
-        self.a_save = act("Save", self.save, QKeySequence.Save)
-        self.a_saveas = act("Save as…", self.save_as, "Ctrl+Shift+S")
-        self.a_pdf = act("Export PDF…", self.do_export_pdf, "Ctrl+E")
-        self.a_png = act("Export PNG…", self.do_export_png)
-        self.a_html = act("Export HTML…", self.do_export_html)
-        self.a_print = act("Print…", self.do_print, QKeySequence.Print)
-        self.a_undo = act("Undo", self.do_undo, QKeySequence.Undo)
-        self.a_redo = act("Redo", self.do_redo, QKeySequence.Redo)
-        self.a_add = act("Add block…", lambda: self.add_event(), "Ctrl+B")
-        self.a_del = act("Delete block", self.delete_event, QKeySequence.Delete)
-        self.a_quit = act("Quit", self.close, QKeySequence.Quit)
-        self.a_slots = act("Saved timespans…", self.edit_timespans)
-        self.a_cols = act("Columns within days…", self.edit_columns)
-        self.a_days = act("Edit days…", self.edit_days)
+        self.a_new = act(tr("New"), self.new_planner, QKeySequence.New)
+        self.a_open = act(tr("Open…"), self.open_planner, QKeySequence.Open)
+        self.a_save = act(tr("Save"), self.save, QKeySequence.Save)
+        self.a_saveas = act(tr("Save as…"), self.save_as, "Ctrl+Shift+S")
+        self.a_pdf = act(tr("Export PDF…"), self.do_export_pdf, "Ctrl+E")
+        self.a_png = act(tr("Export PNG…"), self.do_export_png)
+        self.a_html = act(tr("Export HTML…"), self.do_export_html)
+        self.a_svg = act(tr("Export SVG…"), self.do_export_svg)
+        self.a_print = act(tr("Print…"), self.do_print, QKeySequence.Print)
+        self.a_undo = act(tr("Undo"), self.do_undo, QKeySequence.Undo)
+        self.a_redo = act(tr("Redo"), self.do_redo, QKeySequence.Redo)
+        self.a_add = act(tr("Add block…"), lambda: self.add_event(), "Ctrl+B")
+        self.a_del = act(tr("Delete block"), self.delete_event, QKeySequence.Delete)
+        self.a_quit = act(tr("Quit"), self.close, QKeySequence.Quit)
+        self.a_slots = act(tr("Saved timespans…"), self.edit_timespans)
+        self.a_cols = act(tr("Columns within days…"), self.edit_columns)
+        self.a_days = act(tr("Edit days…"), self.edit_days)
+        self.a_prog = act(tr("Program settings…"), self.open_app_settings)
+        self.a_prog.setMenuRole(QAction.PreferencesRole)
 
-        fm = self.menuBar().addMenu("&File")
+        fm = self.menuBar().addMenu(tr("&File"))
         for a in (self.a_new, self.a_open, "recent", self.a_save, self.a_saveas, None,
-                  self.a_pdf, self.a_png, self.a_html, self.a_print, None, self.a_quit):
+                  self.a_pdf, self.a_png, self.a_svg, self.a_html, self.a_print, None, self.a_quit):
             if a is None:
                 fm.addSeparator()
             elif a == "recent":
-                self.recent_menu = fm.addMenu("Open recent")
+                self.recent_menu = fm.addMenu(tr("Open recent"))
             else:
                 fm.addAction(a)
         self.rebuild_recent_menu()
-        em = self.menuBar().addMenu("&Edit")
+        em = self.menuBar().addMenu(tr("&Edit"))
         for a in (self.a_undo, self.a_redo, None, self.a_add, self.a_del, None, self.a_cols):
             em.addSeparator() if a is None else em.addAction(a)
 
-        sm = self.menuBar().addMenu("&Settings")
+        sm = self.menuBar().addMenu(tr("&Settings"))
+        sm.addAction(self.a_prog)
+        sm.addSeparator()
         sm.addAction(self.a_days)
         sm.addAction(self.a_slots)
 
-        tb = QToolBar("Main")
+        tb = QToolBar(tr("Main"))
         tb.setMovable(False)
         for a in (self.a_new, self.a_open, self.a_save, self.a_saveas, None, self.a_add, None,
                   self.a_pdf, self.a_print, None, self.a_undo, self.a_redo):
@@ -2258,7 +2769,7 @@ class MainWindow(QMainWindow):
 
     def set_dirty(self, v: bool):
         self.dirty = v
-        name = os.path.basename(self.path) if self.path else "Untitled"
+        name = os.path.basename(self.path) if self.path else tr("Untitled")
         self.setWindowTitle(f"{name}{' *' if v else ''} — {APP_NAME}")
 
     def _snapshot(self) -> str:
@@ -2340,14 +2851,16 @@ class MainWindow(QMainWindow):
         msgs = []
         if n:
             msgs.append(
-                f"⚠ {n} block{'s' if n != 1 else ''} (red dashed in the preview) "
-                "don't have room for all their text. Shorten the text, give the block "
-                "more time or width, narrow the hour range or switch to A3.")
+                "⚠ " + trn(n, "{n} block (red dashed in the preview) doesn't have room for all its text. "
+                           "Shorten the text, give the block more time or width, narrow the hour range or switch to A3.",
+                           "{n} blocks (red dashed in the preview) don't have room for all their text. "
+                           "Shorten the text, give the block more time or width, narrow the hour range or switch to A3.").format(n=n))
         if bad:
             msgs.append(
-                f"⚠ {len(bad)} block{'s' if len(bad) != 1 else ''} (marked with ! in the list) "
-                "use an icon image that can't be found: it was linked and the file has moved "
-                "or been deleted. Edit the block and pick the icon again.")
+                "⚠ " + trn(len(bad), "{n} block (marked with ! in the list) uses an icon image that can't be found: "
+                           "it was linked and the file has moved or been deleted. Edit the block and pick the icon again.",
+                           "{n} blocks (marked with ! in the list) use an icon image that can't be found: "
+                           "it was linked and the file has moved or been deleted. Edit the block and pick the icon again.").format(n=len(bad)))
         self.warn.setText("\n\n".join(msgs))
 
     def update_list(self):
@@ -2360,10 +2873,10 @@ class MainWindow(QMainWindow):
             where = self.pl.day_short(ev.day)
             if 0 <= ev.col < len(cols):
                 where += "/" + cols[ev.col]
-            text = f"{where}  {fmt_time(ev.start)}–{fmt_time(ev.end)}  {ev.title or '(no title)'}"
+            text = f"{where}  {range_text(ev.start, ev.end)}  {ev.title or tr('(no title)')}"
             hidden = ev.day not in self.pl.days
             if hidden:
-                text += "  (day hidden)"
+                text += tr("  (day hidden)")
             if ev.id in over:
                 text = "! " + text
             pm = QPixmap(14, 14)
@@ -2498,7 +3011,7 @@ class MainWindow(QMainWindow):
             a.triggered.connect(lambda _=False, f=f: self.open_recent(f))
         if files:
             self.recent_menu.addSeparator()
-            self.recent_menu.addAction("Clear menu").triggered.connect(self.clear_recent)
+            self.recent_menu.addAction(tr("Clear menu")).triggered.connect(self.clear_recent)
         self.recent_menu.setEnabled(bool(files))
 
     def clear_recent(self):
@@ -2512,7 +3025,7 @@ class MainWindow(QMainWindow):
     def maybe_save(self) -> bool:
         if not self.dirty:
             return True
-        r = QMessageBox.question(self, "Unsaved changes", "Save changes to this planner?",
+        r = QMessageBox.question(self, tr("Unsaved changes"), tr("Save changes to this planner?"),
                                  QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         if r == QMessageBox.Save:
             return self.save()
@@ -2530,7 +3043,7 @@ class MainWindow(QMainWindow):
     def open_planner(self):
         if not self.maybe_save():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open planner", self._dir(), FILE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, tr("Open planner"), self._dir(), file_filter())
         if path:
             self.load_path(path)
 
@@ -2538,7 +3051,7 @@ class MainWindow(QMainWindow):
         try:
             self.pl = read_planner(path)
         except Exception as ex:      # noqa: BLE001
-            QMessageBox.critical(self, "Open", f"Could not open the file:\n{ex}")
+            QMessageBox.critical(self, tr("Open"), tr("Could not open the file:\n{ex}").format(ex=ex))
             return
         self.path = path
         self._remember(path)
@@ -2554,7 +3067,7 @@ class MainWindow(QMainWindow):
 
     def save_as(self) -> bool:
         default = self.path or os.path.join(self._dir(), safe_name(self.pl.title) + FILE_EXT)
-        path, _ = QFileDialog.getSaveFileName(self, "Save planner as", default, FILE_FILTER)
+        path, _ = QFileDialog.getSaveFileName(self, tr("Save planner as"), default, file_filter())
         if not path:
             return False
         if not path.lower().endswith(FILE_EXT):
@@ -2565,31 +3078,44 @@ class MainWindow(QMainWindow):
         try:
             write_planner(self.pl, path)
         except OSError as ex:
-            QMessageBox.critical(self, "Save", f"Could not save:\n{ex}")
+            QMessageBox.critical(self, tr("Save"), tr("Could not save:\n{ex}").format(ex=ex))
             return False
         self.path = path
         self._remember(path)
         self.set_dirty(False)
-        self.statusBar().showMessage(f"Saved {path}", 4000)
+        self.statusBar().showMessage(tr("Saved {path}").format(path=path), 4000)
         return True
 
     def do_export_pdf(self):
         default = os.path.join(self._dir(), safe_name(self.pl.title) + ".pdf")
-        path, _ = QFileDialog.getSaveFileName(self, "Export PDF", default, "PDF (*.pdf)")
+        path, _ = QFileDialog.getSaveFileName(self, tr("Export PDF"), default, "PDF (*.pdf)")
         if path:
             if not path.lower().endswith(".pdf"):
                 path += ".pdf"
             export_pdf(self.pl, path)
-            self.statusBar().showMessage(f"Exported {path}", 5000)
+            self.statusBar().showMessage(tr("Exported {path}").format(path=path), 5000)
 
     def do_export_png(self):
         default = os.path.join(self._dir(), safe_name(self.pl.title) + ".png")
-        path, _ = QFileDialog.getSaveFileName(self, "Export PNG", default, "PNG (*.png)")
+        path, _ = QFileDialog.getSaveFileName(self, tr("Export PNG"), default, "PNG (*.png)")
         if path:
             if not path.lower().endswith(".png"):
                 path += ".png"
             export_png(self.pl, path, 200)
-            self.statusBar().showMessage(f"Exported {path}", 5000)
+            self.statusBar().showMessage(tr("Exported {path}").format(path=path), 5000)
+
+    def do_export_svg(self):
+        default = os.path.join(self._dir(), safe_name(self.pl.title) + ".svg")
+        path, _ = QFileDialog.getSaveFileName(self, tr("Export SVG"), default, "SVG (*.svg)")
+        if path:
+            if not path.lower().endswith(".svg"):
+                path += ".svg"
+            try:
+                export_svg(self.pl, path)
+            except OSError as ex:
+                QMessageBox.critical(self, tr("Export"), tr("Could not export:\n{ex}").format(ex=ex))
+                return
+            self.statusBar().showMessage(tr("Exported {path}").format(path=path), 5000)
 
     def do_export_html(self):
         icons = "embed"
@@ -2598,16 +3124,16 @@ class MainWindow(QMainWindow):
             if icons is None:
                 return
         default = os.path.join(self._dir(), safe_name(self.pl.title) + ".html")
-        path, _ = QFileDialog.getSaveFileName(self, "Export HTML", default, "HTML (*.html)")
+        path, _ = QFileDialog.getSaveFileName(self, tr("Export HTML"), default, "HTML (*.html)")
         if path:
             if not path.lower().endswith((".html", ".htm")):
                 path += ".html"
             try:
                 export_html(self.pl, path, icons)
             except OSError as ex:
-                QMessageBox.critical(self, "Export", f"Could not export:\n{ex}")
+                QMessageBox.critical(self, tr("Export"), tr("Could not export:\n{ex}").format(ex=ex))
                 return
-            self.statusBar().showMessage(f"Exported {path}", 5000)
+            self.statusBar().showMessage(tr("Exported {path}").format(path=path), 5000)
 
     def do_print(self):
         print_planner(self.pl, self)
@@ -2674,6 +3200,8 @@ def main(argv: list) -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     PREFS.load()
+    apply_settings()
+    install_qt_translations(app)
     args = argv[1:]
     export = None
     if "--export" in args:
@@ -2686,6 +3214,8 @@ def main(argv: list) -> int:
         pl = read_planner(path) if path else Planner()
         if export.lower().endswith(".png"):
             export_png(pl, export, 200)
+        elif export.lower().endswith(".svg"):
+            export_svg(pl, export)
         elif export.lower().endswith((".html", ".htm")):
             export_html(pl, export, "shared" if "--icons-shared" in argv else "folder" if "--icons-folder" in argv else "embed")
         else:

@@ -3,4 +3,7 @@ dist/
 *.spec
 __pycache__/
 *.pyc
+.buildenv/
+release/
+_version.py
 .DS_Store
