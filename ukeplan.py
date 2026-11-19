@@ -17,6 +17,7 @@ from html import escape as html_escape
 import json
 import os
 import re
+import ssl
 import sys
 import threading
 import urllib.parse
@@ -26,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from PySide6.QtCore import (QBuffer, QByteArray, QIODevice, QLibraryInfo, QLocale,
-                            QMarginsF, QPointF, QRectF, QSettings, QSize,
+                            QEvent, QMarginsF, QPointF, QRectF, QSettings, QSize,
                             QStandardPaths, Qt, QTextBoundaryFinder, QTime,
                             QTimer, QTranslator, QUrl, Signal)
 from PySide6.QtGui import (QAbstractTextDocumentLayout, QAction, QColor, QFont,
@@ -43,7 +44,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
                                QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QPlainTextEdit, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
-                               QTableWidget, QTimeEdit, QToolBar, QVBoxLayout,
+                               QTableWidget, QTimeEdit, QVBoxLayout,
                                QWidget, QFrame, QToolButton)
 
 try:                                  # written by build.py / the release workflow from the git tag
@@ -230,7 +231,6 @@ NO = {
     "&File": "&Fil",
     "&Edit": "&Rediger",
     "&Settings": "&Innstillinger",
-    "Main": "Hovedverktøylinje",
     "Untitled": "Uten navn",
     "Unsaved changes": "Ulagrede endringer",
     "Save changes to this planner?": "Lagre endringer i denne ukeplanen?",
@@ -302,6 +302,14 @@ NO = {
     "{n} block (marked with ! in the list) uses an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokk (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokken og velg ikonet på nytt.",
     "{n} blocks (marked with ! in the list) use an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokker (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokkene og velg ikonet på nytt.",
     "Clear menu": "Tøm menyen",
+    "no release found": "fant ingen versjon",
+    "Version: {v}": "Versjon: {v}",
+    "dev (not a release build)": "dev (ikke en utgitt versjon)",
+    "Check for updates now": "Se etter oppdateringer nå",
+    "Checking…": "Sjekker …",
+    "Could not check for updates: {err}": "Kunne ikke sjekke etter oppdateringer: {err}",
+    "Latest release: {v}. This is a development version.": "Siste versjon: {v}. Dette er en utviklingsversjon.",
+    "You have the latest version ({cur}).": "Du har den nyeste versjonen ({cur}).",
     "No days selected": "Ingen dager valgt",
     "This is not a Ukeplan file.": "Dette er ikke en Ukeplan-fil.",
     "Could not read image: {err}": "Kunne ikke lese bildet: {err}",
@@ -2456,6 +2464,7 @@ class EventDialog(QDialog):
 # --------------------------------------------------------------------------
 class AppSettingsDialog(QDialog):
     """Program settings: language, clock and the update check. Opens by itself on first launch."""
+    checked = Signal(str, str)
 
     def __init__(self, parent=None, first_run: bool = False):
         super().__init__(parent)
@@ -2481,6 +2490,20 @@ class AppSettingsDialog(QDialog):
         self.updates.setChecked(PREFS.check_updates)
         self.updates.setToolTip(tr("Asks github.com for the latest release when the program starts. Nothing else is sent."))
         lay.addWidget(self.updates)
+        row = QHBoxLayout()
+        ver = QLabel(tr("Version: {v}").format(v=VERSION if VERSION != "dev" else tr("dev (not a release build)")))
+        row.addWidget(ver)
+        row.addStretch(1)
+        self.check_btn = QPushButton(tr("Check for updates now"))
+        self.check_btn.clicked.connect(self.check_now)
+        row.addWidget(self.check_btn)
+        lay.addLayout(row)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setOpenExternalLinks(True)
+        self.status.setTextFormat(Qt.RichText)
+        lay.addWidget(self.status)
+        self.checked.connect(self.on_checked)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -2488,6 +2511,32 @@ class AppSettingsDialog(QDialog):
 
     def values(self) -> tuple:
         return self.lang.currentData(), self.clock.currentData(), self.updates.isChecked()
+
+    def check_now(self):
+        self.check_btn.setEnabled(False)
+        self.status.setText(tr("Checking…"))
+
+        def work():
+            tag, err = fetch_latest_version()
+            try:
+                self.checked.emit(tag or "", err)
+            except RuntimeError:                      # dialog was closed meanwhile
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_checked(self, tag: str, err: str):
+        self.check_btn.setEnabled(True)
+        if not tag:
+            self.status.setText(tr("Could not check for updates: {err}").format(err=err))
+        elif VERSION == "dev":
+            self.status.setText(tr("Latest release: {v}. This is a development version.").format(v=tag))
+        elif is_newer(tag, VERSION):
+            self.status.setText(tr("A new version is available: {v} (you have {cur}).").format(v=tag, cur=VERSION)
+                                + f' <a href="{RELEASES_URL}">' + tr("Open the downloads page") + "</a>")
+            if hasattr(self.parent(), "announce_update"):
+                self.parent().announce_update(tag)
+        else:
+            self.status.setText(tr("You have the latest version ({cur}).").format(cur=VERSION))
 
 
 def parse_version(v: str) -> tuple:
@@ -2500,15 +2549,25 @@ def is_newer(latest: str, current: str) -> bool:
     return bool(a) and bool(b) and a > b
 
 
-def fetch_latest_version() -> Optional[str]:
-    """Tag name of the latest GitHub release (e.g. 'v1.2'), or None if it can't be fetched."""
+def fetch_latest_version() -> tuple:
+    """(tag, error): tag name of the latest GitHub release (e.g. 'v1.2'), or (None, why it failed)."""
+    contexts = [ssl.create_default_context()]            # the system's certificates first (works behind proxies)
     try:
-        req = urllib.request.Request(LATEST_API, headers={"Accept": "application/vnd.github+json",
-                                                          "User-Agent": APP_NAME})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            return str(json.load(r).get("tag_name") or "") or None
+        import certifi                                   # fallback: macOS Python often has no system CA list
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
     except Exception:
-        return None
+        pass
+    err = ""
+    for ctx in contexts:
+        try:
+            req = urllib.request.Request(LATEST_API, headers={"Accept": "application/vnd.github+json",
+                                                              "User-Agent": APP_NAME})
+            with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
+                tag = str(json.load(r).get("tag_name") or "")
+            return (tag, "") if tag else (None, tr("no release found"))
+        except Exception as ex:
+            err = str(getattr(ex, "reason", None) or ex)
+    return None, err
 
 
 class MainWindow(QMainWindow):
@@ -2566,16 +2625,13 @@ class MainWindow(QMainWindow):
             a.deleteLater()
         self._actions = []
         self.menuBar().clear()
-        for tb in self.findChildren(QToolBar):
-            self.removeToolBar(tb)
-            tb.deleteLater()
         self._build_ui()
         self._build_actions()
         self.refresh()
 
     def check_for_updates(self):
         def work():
-            tag = fetch_latest_version()
+            tag, _err = fetch_latest_version()
             if tag:
                 self.updateFound.emit(tag)
         threading.Thread(target=work, daemon=True).start()
@@ -2585,6 +2641,10 @@ class MainWindow(QMainWindow):
             return
         if PREFS.dismissed_update == tag:
             return
+        self.announce_update(tag)
+
+    def announce_update(self, tag: str):
+        """Show the banner for a newer release (also after a manual check, even if it was dismissed before)."""
         self._update_version = tag
         self.show_update_bar()
 
@@ -2736,7 +2796,8 @@ class MainWindow(QMainWindow):
         self.a_cols = act(tr("Columns within days…"), self.edit_columns)
         self.a_days = act(tr("Edit days…"), self.edit_days)
         self.a_prog = act(tr("Program settings…"), self.open_app_settings)
-        self.a_prog.setMenuRole(QAction.PreferencesRole)
+        for a in (self.a_prog, self.a_quit):
+            a.setMenuRole(QAction.NoRole)               # stay where we put them; macOS would relocate them
 
         fm = self.menuBar().addMenu(tr("&File"))
         for a in (self.a_new, self.a_open, "recent", self.a_save, self.a_saveas, None,
@@ -2757,13 +2818,6 @@ class MainWindow(QMainWindow):
         sm.addSeparator()
         sm.addAction(self.a_days)
         sm.addAction(self.a_slots)
-
-        tb = QToolBar(tr("Main"))
-        tb.setMovable(False)
-        for a in (self.a_new, self.a_open, self.a_save, self.a_saveas, None, self.a_add, None,
-                  self.a_pdf, self.a_print, None, self.a_undo, self.a_redo):
-            tb.addSeparator() if a is None else tb.addAction(a)
-        self.addToolBar(tb)
 
     # ---- state helpers ---------------------------------------------------
     def selected_id(self) -> Optional[str]:
