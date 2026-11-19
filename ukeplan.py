@@ -35,7 +35,7 @@ from PySide6.QtGui import (QAbstractTextDocumentLayout, QAction, QColor, QFont,
                            QFontMetricsF, QIcon, QImage, QImageReader,
                            QKeySequence, QPageLayout, QPageSize, QPainter,
                            QPainterPath, QPalette, QPdfWriter, QPen, QPixmap,
-                           QTextDocument, QTextOption, QDesktopServices, QValidator)
+                           QTextDocument, QTextOption, QDesktopServices)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
@@ -418,8 +418,8 @@ class Planner:
     landscape: bool = True
     days: list = field(default_factory=lambda: [0, 1, 2, 3, 4])
     auto_range: bool = True
-    range_start: int = 8         # hours (used when auto_range is off)
-    range_end: int = 16
+    range_start: int = 8 * 60    # minutes from midnight (used when auto_range is off)
+    range_end: int = 16 * 60
     events: list = field(default_factory=list)
     subcols: dict = field(default_factory=dict)  # day -> [column names] (blank = default name)
     day_names: list = field(default_factory=lambda: default_days())   # the planner's days
@@ -442,16 +442,18 @@ class Planner:
 
     def time_range(self) -> tuple:
         evs = [e for e in self.events if e.day in self.days]
+        """(first, last) minute shown. Automatic uses whole hours; a fixed range may have minutes."""
         if self.auto_range:
             if evs:
-                lo = min(e.start for e in evs) // 60
-                hi = -(-max(e.end for e in evs) // 60)
+                lo = min(e.start for e in evs) // 60 * 60
+                hi = -(-max(e.end for e in evs) // 60) * 60
             else:
-                lo, hi = 8, 16
+                lo, hi = 8 * 60, 16 * 60
         else:
             lo, hi = self.range_start, self.range_end
-        lo = max(0, min(23, lo))
-        hi = max(lo + 1, min(24, hi))
+        lo = max(0, min(1439, lo))
+        hi = max(lo + 30, min(1440, hi))
+        lo = min(lo, hi - 30)
         return lo, hi
 
     def used_icon_ids(self) -> list:
@@ -474,7 +476,8 @@ class Planner:
         return {"format": "ukeplan", "version": 1, "title": self.title,
                 "page": self.page, "landscape": self.landscape,
                 "days": sorted(self.days), "auto_range": self.auto_range,
-                "range_start": self.range_start, "range_end": self.range_end,
+                "range_start": self.range_start // 60, "range_end": -(-self.range_end // 60),   # whole hours: older versions
+                "range_start_min": self.range_start, "range_end_min": self.range_end,
                 "events": [e.to_dict() for e in self.events],
                 "subcols": {str(d): list(n) for d, n in sorted(self.subcols.items()) if n},
                 "day_names": list(self.day_names), "note": self.note,
@@ -496,8 +499,8 @@ class Planner:
             landscape=bool(d.get("landscape", True)),
             days=sorted(set(shown)),
             auto_range=bool(d.get("auto_range", True)),
-            range_start=int(d.get("range_start", 8)),
-            range_end=int(d.get("range_end", 16)),
+            range_start=int(d["range_start_min"]) if "range_start_min" in d else int(d.get("range_start", 8)) * 60,
+            range_end=int(d["range_end_min"]) if "range_end_min" in d else int(d.get("range_end", 16)) * 60,
             events=events,
             subcols={int(k): [str(x) for x in v] for k, v in dict(d.get("subcols", {})).items()
                      if 0 <= int(k) < len(names) and v},
@@ -798,8 +801,8 @@ class Layout:
     right: float
     top: float
     bottom: float
-    lo: int
-    hi: int
+    lo: int                      # first minute shown
+    hi: int                      # last minute shown
     days: list
     col_w: float
     hour_h: float
@@ -1092,7 +1095,7 @@ def compute_layout(pl: Planner, W: float, H: float) -> Layout:
     top, bottom = m + title_h + head_h + sub_h, H - m - note_h
     n = max(1, len(days))
     col_w = (right - left) / n
-    hour_h = (bottom - top) / (hi - lo)
+    hour_h = (bottom - top) / ((hi - lo) / 60)
 
     placed = []
     pad = 0.5 * MM * k
@@ -1101,8 +1104,8 @@ def compute_layout(pl: Planner, W: float, H: float) -> Layout:
         for ev in pl.events:
             if ev.day != d:
                 continue
-            s = max(ev.start, lo * 60)
-            e = min(max(ev.end, ev.start + 1), hi * 60)
+            s = max(ev.start, lo)
+            e = min(max(ev.end, ev.start + 1), hi)
             if e > s:
                 items.append((ev, s, e))
         names = subs[di]
@@ -1130,7 +1133,7 @@ def compute_layout(pl: Planner, W: float, H: float) -> Layout:
             sub = rw / ncols
             x = rx + idx * sub + pad
             w = span * sub - 2 * pad
-            y = top + (s - lo * 60) / 60 * hour_h + pad * 0.6
+            y = top + (s - lo) / 60 * hour_h + pad * 0.6
             h = (e - s) / 60 * hour_h - pad * 1.2
             img = icon_image(pl, ev.icon)
             tt = time_text(ev)
@@ -1241,19 +1244,34 @@ def paint(p: QPainter, pl: Planner, L: Layout, selected: Optional[str] = None,
     # horizontal lines + time labels
     lab_font = QFont()
     lab_font.setPixelSize(int(2.8 * MM * k))
-    for h in range(L.lo, L.hi + 1):
-        y = L.top + (h - L.lo) * L.hour_h
-        p.setPen(QPen(QColor("#9CA3AF"), 0.25 * MM * k))
-        p.drawLine(QPointF(L.left, y), QPointF(L.right, y))
+    def y_at(minute: float) -> float:
+        return L.top + (minute - L.lo) / 60 * L.hour_h
+
+    def label_at(y: float, text: str):
         p.setFont(lab_font)
         p.setPen(ink)
         p.drawText(QRectF(L.m, y - 2.2 * MM * k, L.time_w - 1.8 * MM * k, 4.4 * MM * k),
-                   Qt.AlignRight | Qt.AlignVCenter, hour_label(h))
-        if h < L.hi and L.hour_h >= 9 * MM * k:
+                   Qt.AlignRight | Qt.AlignVCenter, text)
+
+    marks = list(range(-(-L.lo // 30) * 30, L.hi + 1, 30))          # every half hour inside the range
+    for m_ in marks:
+        y = y_at(m_)
+        if m_ % 60 == 0:
+            p.setPen(QPen(QColor("#9CA3AF"), 0.25 * MM * k))
+            p.drawLine(QPointF(L.left, y), QPointF(L.right, y))
+            label_at(y, hour_label(m_ // 60))
+        elif L.hour_h >= 9 * MM * k:
             pen = QPen(QColor("#D1D5DB"), 0.15 * MM * k)
             pen.setStyle(Qt.DotLine)
             p.setPen(pen)
-            p.drawLine(QPointF(L.left, y + L.hour_h / 2), QPointF(L.right, y + L.hour_h / 2))
+            p.drawLine(QPointF(L.left, y), QPointF(L.right, y))
+    for edge in (L.lo, L.hi):                                        # the table's own top and bottom
+        if edge % 60:
+            y = y_at(edge)
+            p.setPen(QPen(QColor("#9CA3AF"), 0.25 * MM * k))
+            p.drawLine(QPointF(L.left, y), QPointF(L.right, y))
+            if all(abs(edge - m_) >= 30 for m_ in marks if m_ % 60 == 0):
+                label_at(y, fmt_time(edge))
 
     # vertical lines + day names
     p.setPen(QPen(QColor("#6B7280"), 0.3 * MM * k))
@@ -1603,7 +1621,7 @@ class Preview(QWidget):
         q = self._page_pt(e.position())
         if L.left <= q.x() < L.right and L.top <= q.y() < L.bottom:
             di = min(len(L.days) - 1, int((q.x() - L.left) / L.col_w))
-            minutes = L.lo * 60 + (q.y() - L.top) / L.hour_h * 60
+            minutes = L.lo + (q.y() - L.top) / L.hour_h * 60
             names = L.subs[di] if L.subs else []
             col = -1
             if names:
@@ -1614,29 +1632,6 @@ class Preview(QWidget):
 # --------------------------------------------------------------------------
 # Dialogs
 # --------------------------------------------------------------------------
-class HourSpin(QSpinBox):
-    """Whole hours, shown as 08:00 or 8 AM depending on the clock setting."""
-
-    def textFromValue(self, v: int) -> str:
-        return hour_label(v)
-
-    def valueFromText(self, text: str) -> int:
-        m = re.search(r"\d+", text)
-        if not m:
-            return self.value()
-        n = int(m.group())
-        low = text.lower()
-        if "p" in low and n < 12:
-            n += 12
-        elif "a" in low and n == 12:
-            n = 0 if self.minimum() == 0 else 24
-        return max(self.minimum(), min(self.maximum(), n))
-
-    def validate(self, text: str, pos: int):
-        return QValidator.Acceptable if re.fullmatch(r"\s*\d{0,2}\s*(:\s*0{0,2})?\s*([aApP][mM]?)?\s*", text) \
-            else QValidator.Invalid, text, pos
-
-
 class ColorRow(QWidget):
     def __init__(self, color: str):
         super().__init__()
@@ -2735,11 +2730,11 @@ class MainWindow(QMainWindow):
         self.auto_chk.toggled.connect(self.on_range)
         form.addRow(tr("Hours"), self.auto_chk)
         rrow = QHBoxLayout()
-        self.from_spin, self.to_spin = HourSpin(), HourSpin()
-        self.from_spin.setRange(0, 23)
-        self.to_spin.setRange(1, 24)
+        self.from_spin, self.to_spin = QTimeEdit(), QTimeEdit()
         for sp in (self.from_spin, self.to_spin):
-            sp.valueChanged.connect(self.on_range)
+            sp.setDisplayFormat(time_edit_format())
+            sp.timeChanged.connect(self.on_range)
+        self.to_spin.setToolTip(tr("{t} means midnight (end of the day)").format(t=fmt_time(0)))
         rrow.addWidget(self.from_spin)
         rrow.addWidget(QLabel(tr("to")))
         rrow.addWidget(self.to_spin)
@@ -2751,7 +2746,7 @@ class MainWindow(QMainWindow):
         self.listw = QListWidget()
         self.listw.setSelectionMode(QAbstractItemView.SingleSelection)
         self.listw.currentItemChanged.connect(lambda *_: self.preview.set_selected(self.selected_id()))
-        self.listw.itemDoubleClicked.connect(lambda it: self.edit_event(it.data(Qt.UserRole)))
+        self.listw.itemDoubleClicked.connect(lambda it: it.data(Qt.UserRole) and self.edit_event(it.data(Qt.UserRole)))
         el.addWidget(self.listw, 1)
         brow = QHBoxLayout()
         for text, fn in ((tr("Add…"), lambda: self.add_event()), (tr("Edit…"), lambda: self.edit_event()),
@@ -2918,8 +2913,8 @@ class MainWindow(QMainWindow):
             for i, cb in enumerate(self.day_boxes):
                 cb.setChecked(i in pl.days)
             self.auto_chk.setChecked(pl.auto_range)
-            self.from_spin.setValue(pl.range_start)
-            self.to_spin.setValue(pl.range_end)
+            self.from_spin.setTime(qtime_from_minutes(pl.range_start))
+            self.to_spin.setTime(qtime_from_minutes(pl.range_end))
             self.from_spin.setEnabled(not pl.auto_range)
             self.to_spin.setEnabled(not pl.auto_range)
         finally:
@@ -2954,15 +2949,23 @@ class MainWindow(QMainWindow):
         over = {pb.ev.id for pb in self.L.placed if pb.fit.overflow} | self._bad_icon_events
         self.listw.blockSignals(True)
         self.listw.clear()
+        last_day = None
         for ev in sorted(self.pl.events, key=lambda e: (e.day, e.col, e.start, e.end)):
             cols = col_names(self.pl.subcols.get(ev.day, []))
-            where = self.pl.day_short(ev.day)
-            if 0 <= ev.col < len(cols):
-                where += "/" + cols[ev.col]
-            text = f"{where}  {range_text(ev.start, ev.end)}  {ev.title or tr('(no title)')}"
             hidden = ev.day not in self.pl.days
-            if hidden:
-                text += tr("  (day hidden)")
+            if ev.day != last_day:                           # one separator per day: --- Monday ---
+                last_day = ev.day
+                sep = QListWidgetItem("—  " + self.pl.day_label(ev.day) + (tr("  (day hidden)") if hidden else "") + "  —")
+                sep.setFlags(Qt.ItemIsEnabled)               # not selectable
+                sep.setTextAlignment(Qt.AlignCenter)
+                f = sep.font()
+                f.setBold(True)
+                sep.setFont(f)
+                sep.setBackground(QColor("#F3F4F6"))
+                sep.setForeground(QColor("#9CA3AF" if hidden else "#374151"))
+                self.listw.addItem(sep)
+            where = f"[{cols[ev.col]}]  " if 0 <= ev.col < len(cols) else ""
+            text = f"{where}{range_text(ev.start, ev.end)}  {ev.title or tr('(no title)')}"
             if ev.id in over:
                 text = "! " + text
             pm = QPixmap(14, 14)
@@ -3016,12 +3019,13 @@ class MainWindow(QMainWindow):
         if self._syncing:
             return
         auto = self.auto_chk.isChecked()
-        a, b = self.from_spin.value(), self.to_spin.value()
-        if b <= a:
+        a = minutes_from_qtime(self.from_spin.time())
+        b = minutes_from_qtime(self.to_spin.time(), is_end=True)
+        if b - a < 30:                                   # keep at least half an hour on the page
             if self.sender() is self.to_spin:
-                a = max(0, b - 1)
+                a = max(0, b - 30)
             else:
-                b = min(24, a + 1)
+                b = min(1440, a + 30)
 
         def apply():
             self.pl.auto_range, self.pl.range_start, self.pl.range_end = auto, a, b
