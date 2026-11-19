@@ -18,6 +18,7 @@ import json
 import os
 import re
 import ssl
+import subprocess
 import sys
 import threading
 import urllib.parse
@@ -2549,11 +2550,30 @@ def is_newer(latest: str, current: str) -> bool:
     return bool(a) and bool(b) and a > b
 
 
+def _tag_from_json(text: str) -> Optional[str]:
+    return str(json.loads(text).get("tag_name") or "") or None
+
+
+def _fetch_with_curl(url: str) -> Optional[str]:
+    """Last resort: the system's curl, which uses the operating system's own certificates."""
+    import shutil
+    exe = shutil.which("curl")
+    if not exe:
+        return None
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    out = subprocess.run([exe, "-fsSL", "--max-time", "8", "-H", "Accept: application/vnd.github+json",
+                          "-H", f"User-Agent: {APP_NAME}", url],
+                         capture_output=True, text=True, timeout=12, creationflags=flags)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or f"curl exit code {out.returncode}")
+    return _tag_from_json(out.stdout)
+
+
 def fetch_latest_version() -> tuple:
     """(tag, error): tag name of the latest GitHub release (e.g. 'v1.2'), or (None, why it failed)."""
     contexts = [ssl.create_default_context()]            # the system's certificates first (works behind proxies)
     try:
-        import certifi                                   # fallback: macOS Python often has no system CA list
+        import certifi                                   # then certifi: macOS Python often has no system CA list
         contexts.append(ssl.create_default_context(cafile=certifi.where()))
     except Exception:
         pass
@@ -2563,10 +2583,16 @@ def fetch_latest_version() -> tuple:
             req = urllib.request.Request(LATEST_API, headers={"Accept": "application/vnd.github+json",
                                                               "User-Agent": APP_NAME})
             with urllib.request.urlopen(req, timeout=8, context=ctx) as r:
-                tag = str(json.load(r).get("tag_name") or "")
+                tag = _tag_from_json(r.read().decode("utf-8"))
             return (tag, "") if tag else (None, tr("no release found"))
         except Exception as ex:
             err = str(getattr(ex, "reason", None) or ex)
+    try:                                                 # finally: curl (macOS, Windows 10+ and Linux have it)
+        tag = _fetch_with_curl(LATEST_API)
+        if tag:
+            return tag, ""
+    except Exception as ex:
+        err = f"{err}; curl: {ex}"
     return None, err
 
 
