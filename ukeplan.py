@@ -35,7 +35,7 @@ from PySide6.QtGui import (QAbstractTextDocumentLayout, QAction, QColor, QFont,
                            QFontMetricsF, QIcon, QImage, QImageReader,
                            QKeySequence, QPageLayout, QPageSize, QPainter,
                            QPainterPath, QPalette, QPdfWriter, QPen, QPixmap,
-                           QTextDocument, QTextOption, QDesktopServices)
+                           QTextDocument, QTextOption, QDesktopServices, QPolygonF)
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtSvg import QSvgGenerator
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox,
@@ -303,6 +303,9 @@ NO = {
     "{n} block (marked with ! in the list) uses an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokk (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokken og velg ikonet på nytt.",
     "{n} blocks (marked with ! in the list) use an icon image that can't be found: it was linked and the file has moved or been deleted. Edit the block and pick the icon again.": "{n} blokker (merket med ! i listen) bruker et ikonbilde som ikke finnes: det var lenket, og filen er flyttet eller slettet. Rediger blokkene og velg ikonet på nytt.",
     "Clear menu": "Tøm menyen",
+    "Striped background": "Stripet bakgrunn",
+    "Diagonal stripes in two colours. The second colour starts as a slightly lighter shade of the block colour; click it to change it.": "Diagonale striper i to farger. Den andre fargen starter som en litt lysere nyanse av blokkfargen; klikk på den for å endre den.",
+    "Stripe colour": "Stripefarge",
     "no release found": "fant ingen versjon",
     "Version: {v}": "Versjon: {v}",
     "dev (not a release build)": "dev (ikke en utgitt versjon)",
@@ -388,6 +391,7 @@ class Event:
     end: int = 10 * 60
     icon: str = ""               # "" | "emoji:<char>" | "img:<id>"
     color: str = "#BFDBFE"
+    color2: str = ""             # second colour of the diagonal stripes ("" = plain block)
     hide_end: bool = False       # print only the start time; the end still sets the block size
     col: int = -1                # column within the day (-1 = spans all columns of the day)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
@@ -395,7 +399,7 @@ class Event:
     def to_dict(self) -> dict:
         return dict(id=self.id, title=self.title, description=self.description,
                     day=self.day, start=self.start, end=self.end,
-                    icon=self.icon, color=self.color, hide_end=self.hide_end, col=self.col)
+                    icon=self.icon, color=self.color, color2=self.color2, hide_end=self.hide_end, col=self.col)
 
     @staticmethod
     def from_dict(d: dict) -> "Event":
@@ -406,6 +410,7 @@ class Event:
                      day=max(0, int(d.get("day", 0))),
                      start=start, end=end, icon=str(d.get("icon", "")),
                      color=str(d.get("color", "#BFDBFE")),
+                     color2=str(d.get("color2", "")) if QColor(str(d.get("color2", ""))).isValid() else "",
                      hide_end=bool(d.get("hide_end", False)),
                      col=max(-1, int(d.get("col", -1))),
                      id=str(d.get("id") or uuid.uuid4().hex[:10]))
@@ -1159,17 +1164,63 @@ def _fit_font(text: str, px: float, bold: bool, max_w: float) -> QFont:
     return f
 
 
+def stripe_partner(color: str) -> str:
+    """A slightly lighter shade of the colour (slightly darker if it is already almost white)."""
+    c = QColor(color)
+    if not c.isValid():
+        return "#DBEAFE"
+    lt = c.lighter(118)
+    if abs(lt.red() - c.red()) + abs(lt.green() - c.green()) + abs(lt.blue() - c.blue()) < 24:
+        lt = c.darker(110)
+    return lt.name()
+
+
+def draw_stripes(p: QPainter, r: QRectF, color: QColor, rad: float, k: float) -> None:
+    """Diagonal stripes ('/' direction) of `color` over the block, every other band. The shape is cut to the
+    block geometrically (not with a clip path), because SVG/HTML export ignores clip paths."""
+    band = 2.4 * MM * k * 1.41421356            # horizontal width of a band (2.4 mm across)
+    inside = QPainterPath()
+    inside.addRoundedRect(r, rad, rad)
+    stripes = QPainterPath()
+    reach = r.width() + r.height()
+    c = 0.0
+    while c < reach:
+        stripes.addPolygon(QPolygonF([QPointF(r.x() + c, r.y()), QPointF(r.x() + c + band, r.y()),
+                                      QPointF(r.x() + c + band - reach, r.y() + reach),
+                                      QPointF(r.x() + c - reach, r.y() + reach), QPointF(r.x() + c, r.y())]))
+        c += 2 * band
+    stripes.closeSubpath()
+    p.save()
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawPath(stripes.intersected(inside))
+    p.restore()
+
+
 def draw_block(p: QPainter, pb: Placed, k: float) -> None:
     ev, r, f = pb.ev, pb.rect, pb.fit
     base = QColor(ev.color)
     if not base.isValid():
         base = QColor("#BFDBFE")
     rad = 1.2 * MM * k
-    p.setPen(QPen(base.darker(140), 0.3 * MM * k))
-    p.setBrush(base)
-    p.drawRoundedRect(r, rad, rad)
-
-    fg = contrast(base)
+    alt = QColor(ev.color2) if ev.color2 else QColor()
+    outline = QPen(base.darker(140), 0.3 * MM * k)
+    if alt.isValid():
+        p.setPen(Qt.NoPen)
+        p.setBrush(base)
+        p.drawRoundedRect(r, rad, rad)
+        draw_stripes(p, r, alt, rad, k)
+        p.setPen(outline)
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, rad, rad)
+        mix = QColor((base.red() + alt.red()) // 2, (base.green() + alt.green()) // 2,
+                     (base.blue() + alt.blue()) // 2)
+        fg = contrast(mix)
+    else:
+        p.setPen(outline)
+        p.setBrush(base)
+        p.drawRoundedRect(r, rad, rad)
+        fg = contrast(base)
     p.save()
     clip = QPainterPath()
     clip.addRoundedRect(r, rad, rad)
@@ -1633,6 +1684,8 @@ class Preview(QWidget):
 # Dialogs
 # --------------------------------------------------------------------------
 class ColorRow(QWidget):
+    changed = Signal(str)
+
     def __init__(self, color: str):
         super().__init__()
         self.color = color
@@ -1664,6 +1717,7 @@ class ColorRow(QWidget):
     def set_color(self, c: str):
         self.color = c
         self.restyle()
+        self.changed.emit(c)
 
     def pick(self):
         c = QColorDialog.getColor(QColor(self.color), self, tr("Block colour"))
@@ -2170,6 +2224,23 @@ class EventDialog(QDialog):
 
         self.colors = ColorRow(ev.color)
         form.addRow(tr("Colour"), self.colors)
+        stripe_row = QHBoxLayout()
+        self.stripes = QCheckBox(tr("Striped background"))
+        self.stripes.setToolTip(tr("Diagonal stripes in two colours. The second colour starts as a slightly "
+                                   "lighter shade of the block colour; click it to change it."))
+        self.stripe_btn = QPushButton()
+        self.stripe_btn.setFixedWidth(90)
+        self.stripe_btn.clicked.connect(self.pick_stripe_colour)
+        self.stripe_colour = ev.color2
+        self._stripe_touched = bool(ev.color2)          # until the user picks one, it follows the block colour
+        self.stripes.setChecked(bool(ev.color2))
+        self.stripes.toggled.connect(self.on_stripes_toggled)
+        self.colors.changed.connect(self.on_block_colour_changed)
+        stripe_row.addWidget(self.stripes)
+        stripe_row.addWidget(self.stripe_btn)
+        stripe_row.addStretch(1)
+        form.addRow("", stripe_row)
+        self.restyle_stripe_btn()
 
         lay = QVBoxLayout(self)
         lay.addLayout(form)
@@ -2415,6 +2486,30 @@ class EventDialog(QDialog):
                             "or if the image files are moved."))
 
     # ---- accept ----------------------------------------------------------------
+    def restyle_stripe_btn(self):
+        self.stripe_btn.setVisible(self.stripes.isChecked())
+        c = self.stripe_colour or stripe_partner(self.colors.color)
+        self.stripe_btn.setStyleSheet(f"background:{c}; color:{contrast(QColor(c)).name()};"
+                                      "border:1px solid #9CA3AF; border-radius:4px; padding:4px 8px;")
+        self.stripe_btn.setText(tr("Stripe colour"))
+
+    def on_stripes_toggled(self, on: bool):
+        if on and not self.stripe_colour:
+            self.stripe_colour = stripe_partner(self.colors.color)
+        self.restyle_stripe_btn()
+
+    def on_block_colour_changed(self, _c: str):
+        if self.stripes.isChecked() and not self._stripe_touched:
+            self.stripe_colour = stripe_partner(self.colors.color)
+            self.restyle_stripe_btn()
+
+    def pick_stripe_colour(self):
+        c = QColorDialog.getColor(QColor(self.stripe_colour or self.colors.color), self, tr("Stripe colour"))
+        if c.isValid():
+            self.stripe_colour = c.name()
+            self._stripe_touched = True
+            self.restyle_stripe_btn()
+
     def accept(self):
         title = self.title.text().strip()
         desc = self.desc.toPlainText().strip()
@@ -2442,7 +2537,8 @@ class EventDialog(QDialog):
                 skipped.append(self.pl.day_label(d))
                 continue
             ev = Event(title=title, description=desc, day=d, start=sm, end=em,
-                       icon=key, color=self.colors.color, hide_end=self.hide_end.isChecked(),
+                       icon=key, color=self.colors.color, color2=(self.stripe_colour if self.stripes.isChecked() else ""),
+                       hide_end=self.hide_end.isChecked(),
                        col=c)
             if self.editing and i == 0:
                 ev.id = self.ev.id
@@ -2970,6 +3066,12 @@ class MainWindow(QMainWindow):
                 text = "! " + text
             pm = QPixmap(14, 14)
             pm.fill(QColor(ev.color))
+            if ev.color2 and QColor(ev.color2).isValid():
+                sp = QPainter(pm)
+                sp.setPen(Qt.NoPen)
+                sp.setBrush(QColor(ev.color2))
+                sp.drawPolygon(QPolygonF([QPointF(14, 0), QPointF(14, 14), QPointF(0, 14)]))
+                sp.end()
             item = QListWidgetItem(QIcon(pm), text)
             item.setData(Qt.UserRole, ev.id)
             if hidden:
